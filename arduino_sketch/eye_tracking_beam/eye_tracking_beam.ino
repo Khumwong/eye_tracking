@@ -1,16 +1,22 @@
 // Eye Tracking Beam Control
-// Listens for B1\n (beam ON) and B0\n (beam OFF) over serial at 9600 baud.
-// Change BEAM_PIN to match your wiring (relay, transistor, or LED).
+// DB9 interlock: Relay A (pin 4) controls DB9 pins 4-6
+//                Relay B (pin 6) switches DB9 pin 1 between pin 3 (OFF) and pins 4-6 (ON)
+// Commands: B1\n = Beam ON, B0\n = Beam OFF
 
-#define BEAM_PIN 8
+#define RELAY_A 4
+#define RELAY_B 6
 
 String input = "";
 
 void setup() {
   Serial.begin(9600);
-  pinMode(BEAM_PIN, OUTPUT);
-  digitalWrite(BEAM_PIN, LOW);
+  pinMode(RELAY_A, OUTPUT);
+  pinMode(RELAY_B, OUTPUT);
+  digitalWrite(RELAY_A, LOW);
+  digitalWrite(RELAY_B, LOW);
   input.reserve(8);
+  delay(100);
+  Serial.println("READY");
 }
 
 void loop() {
@@ -19,9 +25,11 @@ void loop() {
     if (c == '\n') {
       input.trim();
       if (input == "B1") {
-        digitalWrite(BEAM_PIN, HIGH);
+        digitalWrite(RELAY_A, HIGH);
+        digitalWrite(RELAY_B, HIGH);
       } else if (input == "B0") {
-        digitalWrite(BEAM_PIN, LOW);
+        digitalWrite(RELAY_A, LOW);
+        digitalWrite(RELAY_B, LOW);
       }
       input = "";
     } else {

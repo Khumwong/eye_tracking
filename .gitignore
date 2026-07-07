@@ -1,2 +1,6 @@
 case1/
 venv/
+__pycache__/
+debug/
+video/
+video_test_frames/

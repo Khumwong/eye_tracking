@@ -10,13 +10,19 @@ from PIL import Image, ImageTk
 
 from arduino import ArduinoController
 from capture import CaptureThread
+from config import (
+    BG, PANEL, CARD, INSET, BORD,
+    CYAN, CYAND, CYANL, TEXT, TEXT2, MUTED,
+    GREENB, GREENL, REDB, REDL, AMBERB, AMBERL,
+)
+import config
 
 
 class EyeTrackingApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Eye Tracking Beam Control")
-        self.root.configure(bg='#1e1e1e')
+        self.root.configure(bg=BG)
 
         self.cap = None
         self.capture: CaptureThread | None = None
@@ -26,286 +32,477 @@ class EyeTrackingApp:
 
         self.arduino = ArduinoController()
 
-        # ── tkinter UI vars ────────────────────────────────────
-        self.eye_side      = tk.StringVar(value='left')
-        self.circle_radius = tk.IntVar(value=50)
-        self.center_x      = tk.IntVar(value=320)
-        self.center_y      = tk.IntVar(value=240)
-        self.zoom_level    = tk.DoubleVar(value=1.0)
-        self.zoom_offset_x = tk.IntVar(value=0)
-        self.zoom_offset_y = tk.IntVar(value=0)
-
-        self.input_mode    = tk.StringVar(value='camera')
-        self.video_path    = tk.StringVar(value='')
-        self.video_loop    = tk.BooleanVar(value=True)
+        self.eye_side       = tk.StringVar(value='left')
+        self.circle_radius  = tk.IntVar(value=config.DEFAULT_RADIUS)
+        self.center_x       = tk.IntVar(value=config.DEFAULT_CENTER[0])
+        self.center_y       = tk.IntVar(value=config.DEFAULT_CENTER[1])
+        self.detect_method  = tk.StringVar(value='facemesh')
+        self.threshold_mm   = tk.DoubleVar(value=config.DEFAULT_THRESHOLD_MM)
+        self.input_mode     = tk.StringVar(value='camera')
+        self.video_path     = tk.StringVar(value='')
+        self.video_loop     = tk.BooleanVar(value=True)
         self.playback_speed = tk.DoubleVar(value=1.0)
         self.video_progress = tk.DoubleVar(value=0.0)
 
         self._video_fps          = 30.0
         self._video_total_frames = 0
         self._seeking            = False
+        self._rec_start_time     = 0.0
+        self._rec_path           = ''
 
-        # Recording
-        self._rec_start_time = 0.0
-        self._rec_path       = ''
+        self._display_scale = 1.0
+        self._display_ox    = 0
+        self._display_oy    = 0
+        self._frame_w       = 640
+        self._frame_h       = 480
 
-        # ── Plain dict for capture thread (no tkinter calls there) ──
         self._p: dict = {
-            'zoom': 1.0, 'zoom_ox': 0, 'zoom_oy': 0,
-            'radius': 50, 'cx': 320, 'cy': 240,
+            'radius': config.DEFAULT_RADIUS,
+            'cx': config.DEFAULT_CENTER[0], 'cy': config.DEFAULT_CENTER[1],
             'side': 'left', 'speed': 1.0, 'loop': True,
+            'detect_method': 'facemesh', 'threshold_mm': config.DEFAULT_THRESHOLD_MM,
         }
         self._wire_params()
-
         self._build_ui()
-
-        # Connect Arduino after the event loop starts (avoids blocking main thread)
         self.root.after(100, self._connect_arduino)
+        self.root.after(200, self._check_camera)
 
-    # ── Param sync ────────────────────────────────────────────
+    # ── Param sync ─────────────────────────────────
 
     def _wire_params(self):
-        def sync(key, var):
-            self._p[key] = var.get()
+        def s(k, v): self._p[k] = v.get()
+        self.circle_radius.trace_add( 'write', lambda *_: s('radius',  self.circle_radius))
+        self.center_x.trace_add(      'write', lambda *_: s('cx',      self.center_x))
+        self.center_y.trace_add(      'write', lambda *_: s('cy',      self.center_y))
+        self.eye_side.trace_add(      'write', lambda *_: s('side',          self.eye_side))
+        self.detect_method.trace_add( 'write', lambda *_: s('detect_method', self.detect_method))
+        self.threshold_mm.trace_add(  'write', lambda *_: s('threshold_mm',  self.threshold_mm))
+        self.playback_speed.trace_add('write', lambda *_: s('speed',         self.playback_speed))
+        self.video_loop.trace_add(    'write', lambda *_: s('loop',    self.video_loop))
 
-        self.zoom_level.trace_add(    'write', lambda *_: sync('zoom',    self.zoom_level))
-        self.zoom_offset_x.trace_add( 'write', lambda *_: sync('zoom_ox', self.zoom_offset_x))
-        self.zoom_offset_y.trace_add( 'write', lambda *_: sync('zoom_oy', self.zoom_offset_y))
-        self.circle_radius.trace_add( 'write', lambda *_: sync('radius',  self.circle_radius))
-        self.center_x.trace_add(      'write', lambda *_: sync('cx',      self.center_x))
-        self.center_y.trace_add(      'write', lambda *_: sync('cy',      self.center_y))
-        self.eye_side.trace_add(      'write', lambda *_: sync('side',    self.eye_side))
-        self.playback_speed.trace_add('write', lambda *_: sync('speed',   self.playback_speed))
-        self.video_loop.trace_add(    'write', lambda *_: sync('loop',    self.video_loop))
+    # ── Checks ─────────────────────────────────────
 
-    # ── Arduino ───────────────────────────────────────────────
+    def _check_camera(self):
+        def _work():
+            cap = cv2.VideoCapture(0)
+            ok = cap.isOpened()
+            cap.release()
+            self.root.after(0, lambda: self._led_set(self._cam_led, ok))
+        threading.Thread(target=_work, daemon=True).start()
 
     def _connect_arduino(self):
         def _on_done(ok):
-            self.root.after(0, lambda: self.arduino_status.config(
-                text="● On" if ok else "● Off",
-                fg='#28a745' if ok else '#555'))
-        self.arduino.connect_async('/dev/ttyUSB0', 9600, _on_done)
+            self.root.after(0, lambda: self._led_set(self._ard_led, ok))
+        port = self._find_arduino_port()
+        if port:
+            self.arduino.connect_async(port, config.ARDUINO_BAUD, _on_done)
+        self.root.after(2000, self._poll_arduino_status)
 
-    # ── UI build ──────────────────────────────────────────────
+    def _poll_arduino_status(self):
+        def _check():
+            port = self._find_arduino_port()
+            if not port:
+                if self.arduino.is_connected:
+                    self.arduino.close()
+                self.root.after(0, lambda: self._led_set(self._ard_led, False))
+            elif not self.arduino.is_connected:
+                def _on_done(ok):
+                    self.root.after(0, lambda: self._led_set(self._ard_led, ok))
+                self.arduino.connect_async(port, config.ARDUINO_BAUD, _on_done)
+            self.root.after(2000, self._poll_arduino_status)
+        threading.Thread(target=_check, daemon=True).start()
+
+    @staticmethod
+    def _find_arduino_port():
+        try:
+            from serial.tools.list_ports import comports
+            # CH340 VID:PID=1A86:7523
+            for p in comports():
+                if p.vid == config.ARDUINO_VID and p.pid == config.ARDUINO_PID:
+                    return p.device
+        except Exception:
+            pass
+        return None
+
+    # ── LED indicators ─────────────────────────────
+
+    def _led_make(self, parent, label):
+        f = tk.Frame(parent, bg=PANEL)
+        f.pack(fill=tk.X, pady=3)
+        c = tk.Canvas(f, width=12, height=12, bg=PANEL,
+                      highlightthickness=0)
+        c.pack(side=tk.LEFT, padx=(0, 8))
+        ov = c.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
+        tk.Label(f, text=label, bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        self._lbl = tk.Label(f, text="—", bg=PANEL, fg=MUTED,
+                             font=('Helvetica', 9))
+        self._lbl.pack(side=tk.RIGHT)
+        return c, ov, self._lbl
+
+    def _led_set(self, led_info, ok):
+        c, ov, lbl = led_info
+        c.itemconfig(ov, fill=GREENL if ok else MUTED)
+        lbl.config(text="Connected" if ok else "Offline",
+                   fg=GREENL if ok else MUTED)
+
+    # ── UI helpers ─────────────────────────────────
+
+    def _section_header(self, parent, title):
+        f = tk.Frame(parent, bg=PANEL, pady=0)
+        f.pack(fill=tk.X, padx=12, pady=(14, 4))
+        tk.Frame(f, bg=CYAN, width=3, height=14).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(f, text=title, bg=PANEL, fg=CYANL,
+                 font=('Helvetica', 8, 'bold')).pack(side=tk.LEFT, anchor='s')
+
+    def _divider(self, parent):
+        tk.Frame(parent, bg=BORD, height=1).pack(fill=tk.X, padx=12, pady=(8, 0))
+
+    def _flat_btn(self, parent, text, cmd, bg, fg, abg=None, state=tk.NORMAL):
+        return tk.Button(parent, text=text, command=cmd,
+                         bg=bg, fg=fg, activebackground=abg or bg,
+                         activeforeground=fg, relief='flat', cursor='hand2',
+                         font=('Helvetica', 10, 'bold'), pady=10,
+                         state=state, bd=0)
+
+    def _readout(self, parent, label, value, unit=''):
+        f = tk.Frame(parent, bg=CARD, padx=10, pady=6)
+        f.pack(fill=tk.X, padx=12, pady=2)
+        tk.Label(f, text=label, bg=CARD, fg=TEXT2,
+                 font=('Helvetica', 8)).pack(side=tk.LEFT)
+        lbl = tk.Label(f, text=f"{value}{unit}", bg=CARD, fg=CYANL,
+                       font=('Courier', 10, 'bold'))
+        lbl.pack(side=tk.RIGHT)
+        return lbl
+
+    def _nav_pad(self, parent, up_cmd, dn_cmd, lt_cmd, rt_cmd, rst_cmd):
+        f = tk.Frame(parent, bg=PANEL)
+        f.pack(pady=(2, 6))
+        s = dict(bg=CARD, fg=TEXT2, relief='flat', width=3,
+                 cursor='hand2', activebackground=INSET,
+                 activeforeground=CYANL, font=('Helvetica', 12), pady=3)
+        tk.Button(f, text="↑", command=up_cmd,  **s).grid(row=0, column=1, padx=2, pady=2)
+        tk.Button(f, text="←", command=lt_cmd,  **s).grid(row=1, column=0, padx=2, pady=2)
+        tk.Button(f, text="⊕", command=rst_cmd, **s).grid(row=1, column=1, padx=2, pady=2)
+        tk.Button(f, text="→", command=rt_cmd,  **s).grid(row=1, column=2, padx=2, pady=2)
+        tk.Button(f, text="↓", command=dn_cmd,  **s).grid(row=2, column=1, padx=2, pady=2)
+
+    # ── Build UI ───────────────────────────────────
 
     def _build_ui(self):
-        left_outer = tk.Frame(self.root, bg='#252525', width=210)
-        left_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 4), pady=8)
-        left_outer.pack_propagate(False)
+        # ── Sidebar ────────────────────────────────
+        sidebar = tk.Frame(self.root, bg=PANEL, width=260)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
 
-        canvas = tk.Canvas(left_outer, bg='#252525', highlightthickness=0)
-        sb = tk.Scrollbar(left_outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas = tk.Canvas(sidebar, bg=PANEL, highlightthickness=0)
+        sb = tk.Scrollbar(sidebar, orient=tk.VERTICAL, command=canvas.yview,
+                          bg=PANEL, troughcolor=PANEL, bd=0, width=6)
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        left = tk.Frame(canvas, bg='#252525')
-        win  = canvas.create_window((0, 0), window=left, anchor='nw')
-        left.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
+        inner = tk.Frame(canvas, bg=PANEL)
+        win = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.bind('<Configure>', lambda e: canvas.itemconfig(win, width=e.width))
+        canvas.bind_all('<Button-4>', lambda _: canvas.yview_scroll(-1, 'units'))
+        canvas.bind_all('<Button-5>', lambda _: canvas.yview_scroll( 1, 'units'))
         canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(-1*(e.delta//120), 'units'))
-        canvas.bind_all('<Button-4>',   lambda _: canvas.yview_scroll(-1, 'units'))
-        canvas.bind_all('<Button-5>',   lambda _: canvas.yview_scroll( 1, 'units'))
 
-        self.camera_label = tk.Label(self.root, bg='black')
-        self.camera_label.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True,
-                               padx=(4, 8), pady=8)
+        # ── Header ─────────────────────────────────
+        hdr = tk.Frame(inner, bg=CYAND, pady=0)
+        hdr.pack(fill=tk.X)
+        tk.Frame(hdr, bg=CYAN, height=3).pack(fill=tk.X)
+        body = tk.Frame(hdr, bg=CYAND, pady=12)
+        body.pack(fill=tk.X)
+        tk.Label(body, text="EYE TRACKING", bg=CYAND, fg='white',
+                 font=('Helvetica', 12, 'bold')).pack()
+        tk.Label(body, text="Beam Control System", bg=CYAND, fg=CYANL,
+                 font=('Helvetica', 8)).pack()
 
-        # Connection
-        self._section(left, "CONNECTION")
-        conn = tk.Frame(left, bg='#252525')
-        conn.pack(fill=tk.X, padx=12, pady=(0, 4))
-        self.arduino_status = self._dot(conn, "Arduino")
-        self.source_status  = self._dot(conn, "Source")
-        self._sep(left)
+        # ── Status ─────────────────────────────────
+        self._section_header(inner, "SYSTEM STATUS")
+        st = tk.Frame(inner, bg=PANEL)
+        st.pack(fill=tk.X, padx=14)
 
-        # Source tabs
-        self._section(left, "SOURCE")
-        tabs = tk.Frame(left, bg='#252525')
-        tabs.pack(fill=tk.X, padx=12, pady=(2, 0))
+        f1 = tk.Frame(st, bg=PANEL)
+        f1.pack(fill=tk.X, pady=2)
+        c1 = tk.Canvas(f1, width=12, height=12, bg=PANEL, highlightthickness=0)
+        c1.pack(side=tk.LEFT, padx=(0, 8))
+        ov1 = c1.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
+        tk.Label(f1, text="Arduino", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        lbl1 = tk.Label(f1, text="Offline", bg=PANEL, fg=MUTED,
+                        font=('Helvetica', 9))
+        lbl1.pack(side=tk.RIGHT)
+        self._ard_led = (c1, ov1, lbl1)
+
+        f2 = tk.Frame(st, bg=PANEL)
+        f2.pack(fill=tk.X, pady=2)
+        c2 = tk.Canvas(f2, width=12, height=12, bg=PANEL, highlightthickness=0)
+        c2.pack(side=tk.LEFT, padx=(0, 8))
+        ov2 = c2.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
+        tk.Label(f2, text="Camera", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        lbl2 = tk.Label(f2, text="Offline", bg=PANEL, fg=MUTED,
+                        font=('Helvetica', 9))
+        lbl2.pack(side=tk.RIGHT)
+        self._cam_led = (c2, ov2, lbl2)
+
+        # Precision indicator
+        tk.Frame(st, bg=BORD, height=1).pack(fill=tk.X, pady=(8, 4))
+        prow1 = tk.Frame(st, bg=PANEL)
+        prow1.pack(fill=tk.X, pady=1)
+        tk.Label(prow1, text="Iris size", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        self._iris_px_lbl = tk.Label(prow1, text="— px", bg=PANEL, fg=MUTED,
+                                      font=('Courier', 9, 'bold'))
+        self._iris_px_lbl.pack(side=tk.RIGHT)
+
+        prow2 = tk.Frame(st, bg=PANEL)
+        prow2.pack(fill=tk.X, pady=1)
+        tk.Label(prow2, text="Precision", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        self._precision_lbl = tk.Label(prow2, text="— mm/px", bg=PANEL, fg=MUTED,
+                                        font=('Courier', 9, 'bold'))
+        self._precision_lbl.pack(side=tk.RIGHT)
+
+        prow3 = tk.Frame(st, bg=PANEL)
+        prow3.pack(fill=tk.X, pady=1)
+        tk.Label(prow3, text="2 mm =", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        self._px2mm_lbl = tk.Label(prow3, text="— px", bg=PANEL, fg=MUTED,
+                                    font=('Courier', 9, 'bold'))
+        self._px2mm_lbl.pack(side=tk.RIGHT)
+
+        # Deviation readout
+        tk.Frame(st, bg=BORD, height=1).pack(fill=tk.X, pady=(8, 4))
+        drow = tk.Frame(st, bg=PANEL)
+        drow.pack(fill=tk.X, pady=1)
+        tk.Label(drow, text="Deviation", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        self._dev_lbl = tk.Label(drow, text="— mm", bg=PANEL, fg=MUTED,
+                                  font=('Courier', 10, 'bold'))
+        self._dev_lbl.pack(side=tk.RIGHT)
+
+        self._divider(inner)
+
+        # ── Source ─────────────────────────────────
+        self._section_header(inner, "INPUT SOURCE")
+        tabs = tk.Frame(inner, bg=INSET, padx=2, pady=2)
+        tabs.pack(fill=tk.X, padx=12, pady=(0, 4))
         tabs.columnconfigure(0, weight=1)
         tabs.columnconfigure(1, weight=1)
-        self._cam_tab = tk.Button(tabs, text="CAMERA",
+        self._cam_tab = tk.Button(tabs, text="Camera",
                                    command=lambda: self._set_source('camera'),
-                                   relief='flat', cursor='hand2', pady=7,
-                                   font=('Arial', 9, 'bold'), bd=0)
+                                   relief='flat', cursor='hand2', pady=7, bd=0,
+                                   font=('Helvetica', 9, 'bold'))
         self._cam_tab.grid(row=0, column=0, sticky='ew', padx=(0, 1))
-        self._vid_tab = tk.Button(tabs, text="VIDEO",
+        self._vid_tab = tk.Button(tabs, text="Video",
                                    command=lambda: self._set_source('video'),
-                                   relief='flat', cursor='hand2', pady=7,
-                                   font=('Arial', 9, 'bold'), bd=0)
+                                   relief='flat', cursor='hand2', pady=7, bd=0,
+                                   font=('Helvetica', 9, 'bold'))
         self._vid_tab.grid(row=0, column=1, sticky='ew', padx=(1, 0))
         self._tab_row = tabs
         self._update_tabs()
 
-        # Video panel (hidden until VIDEO tab selected)
-        self.video_panel = tk.Frame(left, bg='#1e1e1e', pady=4)
-        tk.Label(self.video_panel, text="File", bg='#1e1e1e', fg='#888',
-                 font=('Arial', 8)).pack(anchor=tk.W, padx=10, pady=(4, 0))
-        frow = tk.Frame(self.video_panel, bg='#1e1e1e')
-        frow.pack(fill=tk.X, padx=10, pady=(0, 6))
-        tk.Entry(frow, textvariable=self.video_path, bg='#333', fg='white',
-                 insertbackground='white', relief='flat',
-                 font=('Arial', 8)).pack(side=tk.LEFT, fill=tk.X, expand=True,
-                                         padx=(0, 4), ipady=4)
-        tk.Button(frow, text="Browse", command=self._browse,
-                  bg='#444', fg='white', relief='flat', cursor='hand2',
-                  font=('Arial', 8), padx=6, pady=3).pack(side=tk.LEFT)
+        # Video panel
+        self.video_panel = tk.Frame(inner, bg=CARD)
+        tk.Label(self.video_panel, text="FILE PATH", bg=CARD, fg=TEXT2,
+                 font=('Helvetica', 7, 'bold')).pack(anchor='w', padx=12, pady=(8, 2))
+        frow = tk.Frame(self.video_panel, bg=CARD)
+        frow.pack(fill=tk.X, padx=12, pady=(0, 6))
+        tk.Entry(frow, textvariable=self.video_path, bg=INSET, fg=TEXT,
+                 insertbackground=CYANL, relief='flat',
+                 font=('Courier', 8)).pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                            padx=(0, 4), ipady=5)
+        tk.Button(frow, text="Browse", command=self._browse, bg=CYAND, fg='white',
+                  relief='flat', cursor='hand2', font=('Helvetica', 8, 'bold'),
+                  padx=8, pady=4, activebackground=CYAN,
+                  activeforeground='white').pack(side=tk.LEFT)
 
-        orow = tk.Frame(self.video_panel, bg='#1e1e1e')
-        orow.pack(fill=tk.X, padx=10, pady=(0, 2))
+        orow = tk.Frame(self.video_panel, bg=CARD)
+        orow.pack(fill=tk.X, padx=12, pady=(0, 4))
         tk.Checkbutton(orow, text="Loop", variable=self.video_loop,
-                       bg='#1e1e1e', fg='#ccc', selectcolor='#444',
-                       activebackground='#1e1e1e', font=('Arial', 9)).pack(side=tk.LEFT)
-        self.speed_lbl = tk.Label(orow, text="1.00x", bg='#1e1e1e',
-                                   fg='#fd7e14', font=('Arial', 9, 'bold'), width=6)
+                       bg=CARD, fg=TEXT2, selectcolor=INSET,
+                       activebackground=CARD, font=('Helvetica', 9)).pack(side=tk.LEFT)
+        self.speed_lbl = tk.Label(orow, text="1.00×", bg=CARD, fg=AMBERL,
+                                   font=('Courier', 9, 'bold'), width=6)
         self.speed_lbl.pack(side=tk.RIGHT)
-        tk.Label(orow, text="Speed:", bg='#1e1e1e', fg='#888',
-                 font=('Arial', 8)).pack(side=tk.RIGHT)
+        tk.Label(orow, text="Speed", bg=CARD, fg=TEXT2,
+                 font=('Helvetica', 8)).pack(side=tk.RIGHT, padx=(0, 4))
         tk.Scale(self.video_panel, from_=0.25, to=4.0, resolution=0.25,
                  orient=tk.HORIZONTAL, variable=self.playback_speed,
-                 bg='#1e1e1e', troughcolor='#444', highlightthickness=0,
-                 showvalue=False, fg='white',
-                 command=lambda v: self.speed_lbl.config(
-                     text=f"{float(v):.2f}x")).pack(fill=tk.X, padx=10, pady=(0, 4))
+                 bg=CARD, troughcolor=INSET, highlightthickness=0,
+                 showvalue=False, fg=TEXT,
+                 command=lambda v: self.speed_lbl.config(text=f"{float(v):.2f}×")
+                 ).pack(fill=tk.X, padx=12, pady=(0, 4))
 
-        tk.Frame(self.video_panel, bg='#333', height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
+        tk.Frame(self.video_panel, bg=BORD, height=1).pack(fill=tk.X, padx=12, pady=4)
         self.prog_lbl = tk.Label(self.video_panel, text="--:-- / --:--",
-                                  bg='#1e1e1e', fg='#888', font=('Arial', 8))
+                                  bg=CARD, fg=TEXT2, font=('Courier', 8))
         self.prog_lbl.pack()
         self.prog_slider = tk.Scale(self.video_panel, from_=0, to=100, resolution=0.1,
                                      orient=tk.HORIZONTAL, variable=self.video_progress,
-                                     bg='#1e1e1e', troughcolor='#444', highlightthickness=0,
-                                     showvalue=False, fg='white', state=tk.DISABLED,
+                                     bg=CARD, troughcolor=INSET, highlightthickness=0,
+                                     showvalue=False, fg=TEXT, state=tk.DISABLED,
                                      command=self._on_seek)
-        self.prog_slider.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self.prog_slider.pack(fill=tk.X, padx=12, pady=(0, 8))
 
-        self._sep(left)
+        self._divider(inner)
 
-        # Eye side
-        self._section(left, "EYE SIDE")
-        er = tk.Frame(left, bg='#252525')
-        er.pack(fill=tk.X, padx=12, pady=(2, 6))
-        for txt, val in (("Left", "left"), ("Right", "right")):
+        # ── Eye side ───────────────────────────────
+        self._section_header(inner, "EYE SELECTION")
+        er = tk.Frame(inner, bg=PANEL)
+        er.pack(fill=tk.X, padx=12, pady=(0, 4))
+        for txt, val in (("Left Eye", "left"), ("Right Eye", "right")):
             tk.Radiobutton(er, text=txt, variable=self.eye_side, value=val,
-                           **self._rb()).pack(side=tk.LEFT, padx=(0, 12))
-        self._sep(left)
+                           bg=PANEL, fg=TEXT2, selectcolor=INSET,
+                           activebackground=PANEL, activeforeground=CYANL,
+                           font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(0, 16))
 
-        # Settings
-        self._section(left, "SETTINGS")
-        rrow = tk.Frame(left, bg='#252525')
+        self._divider(inner)
+
+        # ── Settings ───────────────────────────────
+        self._section_header(inner, "DETECTION PARAMETERS")
+
+        # Detection method toggle
+        dtabs = tk.Frame(inner, bg=INSET, padx=2, pady=2)
+        dtabs.pack(fill=tk.X, padx=12, pady=(2, 8))
+        dtabs.columnconfigure(0, weight=1)
+        dtabs.columnconfigure(1, weight=1)
+        self._fm_tab = tk.Button(dtabs, text="FaceMesh",
+                                  command=lambda: self._set_detect('facemesh'),
+                                  relief='flat', cursor='hand2', pady=7, bd=0,
+                                  font=('Helvetica', 9, 'bold'))
+        self._fm_tab.grid(row=0, column=0, sticky='ew', padx=(0, 1))
+        self._fp_tab = tk.Button(dtabs, text="FaceMesh + Pupil",
+                                  command=lambda: self._set_detect('facemesh_pupil'),
+                                  relief='flat', cursor='hand2', pady=7, bd=0,
+                                  font=('Helvetica', 9, 'bold'))
+        self._fp_tab.grid(row=0, column=1, sticky='ew', padx=(1, 0))
+        self._update_detect_tabs()
+
+        # Threshold
+        trow = tk.Frame(inner, bg=PANEL)
+        trow.pack(fill=tk.X, padx=12, pady=(6, 2))
+        tk.Label(trow, text="Threshold", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        self._thr_lbl = tk.Label(trow, text="3.0 mm", bg=PANEL, fg=AMBERL,
+                                  font=('Courier', 10, 'bold'))
+        self._thr_lbl.pack(side=tk.RIGHT)
+        tk.Scale(inner, from_=0.5, to=10.0, resolution=0.5,
+                 orient=tk.HORIZONTAL, variable=self.threshold_mm,
+                 bg=PANEL, troughcolor=INSET, highlightthickness=0,
+                 showvalue=False, fg=TEXT,
+                 command=lambda v: self._thr_lbl.config(text=f"{float(v):.1f} mm")
+                 ).pack(fill=tk.X, padx=12, pady=(0, 6))
+
+        # Radius
+        rrow = tk.Frame(inner, bg=PANEL)
         rrow.pack(fill=tk.X, padx=12, pady=(2, 4))
-        tk.Label(rrow, text="Radius:", bg='#252525', fg='#aaa',
-                 font=('Arial', 9)).pack(side=tk.LEFT)
-        tk.Spinbox(rrow, from_=10, to=300, textvariable=self.circle_radius,
-                   width=5, bg='#333', fg='white',
-                   buttonbackground='#444', relief='flat').pack(side=tk.LEFT, padx=6)
-        tk.Label(rrow, text="px", bg='#252525', fg='#666',
-                 font=('Arial', 9)).pack(side=tk.LEFT)
+        tk.Label(rrow, text="Radius", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        self._r_lbl = tk.Label(rrow, text=" 50 px", bg=PANEL, fg=CYANL,
+                                font=('Courier', 10, 'bold'))
+        self._r_lbl.pack(side=tk.RIGHT)
+        self.circle_radius.trace_add('write', lambda *_: self._r_lbl.config(
+            text=f"{self.circle_radius.get():3d} px"))
+        sp = tk.Spinbox(inner, from_=10, to=300, textvariable=self.circle_radius,
+                        width=6, bg=INSET, fg=CYANL, buttonbackground=CARD,
+                        relief='flat', insertbackground=CYANL,
+                        font=('Courier', 10), justify='center')
+        sp.pack(fill=tk.X, padx=12, pady=(0, 6))
 
-        zrow = tk.Frame(left, bg='#252525')
-        zrow.pack(fill=tk.X, padx=12, pady=(4, 0))
-        tk.Label(zrow, text="Zoom:", bg='#252525', fg='#aaa',
-                 font=('Arial', 9)).pack(side=tk.LEFT)
-        self.zoom_lbl = tk.Label(zrow, text="1.0x", bg='#252525',
-                                  fg='#0d6efd', font=('Arial', 9, 'bold'), width=5)
-        self.zoom_lbl.pack(side=tk.RIGHT)
-        tk.Scale(left, from_=1.0, to=4.0, resolution=0.5,
-                 orient=tk.HORIZONTAL, variable=self.zoom_level,
-                 bg='#252525', troughcolor='#444', highlightthickness=0,
-                 showvalue=False, fg='white',
-                 command=self._on_zoom).pack(fill=tk.X, padx=12, pady=(0, 6))
+        self._divider(inner)
 
-        self.zpan_lbl = tk.Label(left, text="Pan view: X:0  Y:0",
-                                  bg='#252525', fg='#888', font=('Arial', 8))
-        self.zpan_lbl.pack(pady=(0, 2))
-        bz = dict(bg='#2a2a2a', fg='#aaa', relief='flat', width=2,
-                  cursor='hand2', activebackground='#444', font=('Arial', 10))
-        zp = tk.Frame(left, bg='#252525')
-        zp.pack(pady=(0, 4))
-        tk.Button(zp, text="↑", command=lambda: self._zoom_pan(0, -20),  **bz).grid(row=0, column=1, padx=2, pady=1)
-        tk.Button(zp, text="←", command=lambda: self._zoom_pan(-20, 0),  **bz).grid(row=1, column=0, padx=2, pady=1)
-        tk.Button(zp, text="⊙", command=self._zoom_pan_reset,             **bz).grid(row=1, column=1, padx=2, pady=1)
-        tk.Button(zp, text="→", command=lambda: self._zoom_pan(20, 0),   **bz).grid(row=1, column=2, padx=2, pady=1)
-        tk.Button(zp, text="↓", command=lambda: self._zoom_pan(0, 20),   **bz).grid(row=2, column=1, padx=2, pady=1)
-        self._sep(left)
+        # ── Target position ────────────────────────
+        self._section_header(inner, "TARGET POSITION")
+        self.pos_lbl = tk.Label(inner, text="X: 320   Y: 240",
+                                 bg=PANEL, fg=CYANL, font=('Courier', 10, 'bold'))
+        self.pos_lbl.pack(pady=(2, 4))
+        self._nav_pad(inner,
+                      up_cmd=lambda: self._pan(0, -10),
+                      dn_cmd=lambda: self._pan(0,  10),
+                      lt_cmd=lambda: self._pan(-10, 0),
+                      rt_cmd=lambda: self._pan(10,  0),
+                      rst_cmd=self._pan_reset)
 
-        # Position (green circle)
-        self._section(left, "POSITION")
-        self.pos_lbl = tk.Label(left, text="X: 320   Y: 240",
-                                 bg='#252525', fg='#888', font=('Arial', 8))
-        self.pos_lbl.pack(pady=(0, 4))
-        bp = dict(bg='#333', fg='white', relief='flat', width=3,
-                  cursor='hand2', activebackground='#444', font=('Arial', 10))
-        pg = tk.Frame(left, bg='#252525')
-        pg.pack(pady=(0, 4))
-        tk.Button(pg, text="↑", command=lambda: self._pan(0, -10),  **bp).grid(row=0, column=1, padx=2, pady=2)
-        tk.Button(pg, text="←", command=lambda: self._pan(-10, 0),  **bp).grid(row=1, column=0, padx=2, pady=2)
-        tk.Button(pg, text="⊙", command=self._pan_reset,             **bp).grid(row=1, column=1, padx=2, pady=2)
-        tk.Button(pg, text="→", command=lambda: self._pan(10, 0),   **bp).grid(row=1, column=2, padx=2, pady=2)
-        tk.Button(pg, text="↓", command=lambda: self._pan(0, 10),   **bp).grid(row=2, column=1, padx=2, pady=2)
-        self._sep(left)
+        self._divider(inner)
 
-        # Beam
-        self.beam_lbl = tk.Label(left, text="BEAM OFF", bg='#333', fg='#888',
-                                  font=('Arial', 13, 'bold'), pady=10, relief='flat')
-        self.beam_lbl.pack(fill=tk.X, padx=12, pady=6)
-        self._sep(left)
+        # ── Beam status ────────────────────────────
+        beam_outer = tk.Frame(inner, bg=BORD, padx=1, pady=1)
+        beam_outer.pack(fill=tk.X, padx=12, pady=10)
+        self._beam_frame = tk.Frame(beam_outer, bg=CARD, pady=14)
+        self._beam_frame.pack(fill=tk.X)
+        beam_top = tk.Frame(self._beam_frame, bg=CARD)
+        beam_top.pack()
+        self._beam_dot = tk.Canvas(beam_top, width=14, height=14, bg=CARD,
+                                    highlightthickness=0)
+        self._beam_dot.pack(side=tk.LEFT, padx=(0, 8))
+        self._beam_oval = self._beam_dot.create_oval(2, 2, 12, 12,
+                                                      fill=MUTED, outline='')
+        self.beam_lbl = tk.Label(beam_top, text="BEAM OFF",
+                                  bg=CARD, fg=MUTED,
+                                  font=('Helvetica', 13, 'bold'))
+        self.beam_lbl.pack(side=tk.LEFT)
+        self._beam_sub = tk.Label(self._beam_frame, text="Shutter: Closed",
+                                   bg=CARD, fg=MUTED, font=('Helvetica', 8))
+        self._beam_sub.pack(pady=(4, 0))
 
-        # Buttons
-        self.start_btn = tk.Button(left, text="▶  START", command=self.start,
-                                    bg='#28a745', fg='white', font=('Arial', 11, 'bold'),
-                                    relief='flat', pady=9, cursor='hand2',
-                                    activebackground='#218838')
-        self.start_btn.pack(fill=tk.X, padx=12, pady=(4, 2))
+        # ── Controls ───────────────────────────────
+        ctrl = tk.Frame(inner, bg=PANEL)
+        ctrl.pack(fill=tk.X, padx=12, pady=(4, 2))
 
-        self.stop_btn = tk.Button(left, text="■  STOP", command=self.stop,
-                                   bg='#dc3545', fg='white', font=('Arial', 11, 'bold'),
-                                   relief='flat', pady=9, cursor='hand2',
-                                   activebackground='#b02a37', state=tk.DISABLED)
-        self.stop_btn.pack(fill=tk.X, padx=12, pady=2)
+        self.start_btn = self._flat_btn(ctrl, "▶   START TRACKING",
+                                         self.start, CYAN, CYAND, CYAND)
+        self.start_btn.pack(fill=tk.X, pady=(0, 3))
 
-        self.pause_btn = tk.Button(left, text="⏸  PAUSE", command=self._toggle_pause,
-                                    bg='#444', fg='#888', font=('Arial', 11, 'bold'),
-                                    relief='flat', pady=9, cursor='hand2',
-                                    activebackground='#555', state=tk.DISABLED)
-        self.pause_btn.pack(fill=tk.X, padx=12, pady=(2, 6))
-        self._sep(left)
+        self.stop_btn = self._flat_btn(ctrl, "■   STOP",
+                                        self.stop, CARD, TEXT2, INSET,
+                                        state=tk.DISABLED)
+        tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
+        self.stop_btn.pack(fill=tk.X, pady=(0, 3))
+        tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
 
-        # Record
-        self._section(left, "RECORD  (camera only)")
-        self.rec_timer_lbl = tk.Label(left, text="", bg='#252525', fg='#dc3545',
-                                       font=('Arial', 9, 'bold'))
-        self.rec_timer_lbl.pack(pady=(0, 2))
-        self.rec_btn = tk.Button(left, text="⏺  REC", command=self._toggle_rec,
-                                  bg='#444', fg='#888', font=('Arial', 11, 'bold'),
-                                  relief='flat', pady=9, cursor='hand2',
-                                  activebackground='#555', state=tk.DISABLED)
+        self.pause_btn = self._flat_btn(ctrl, "⏸   PAUSE",
+                                         self._toggle_pause, PANEL, MUTED,
+                                         INSET, state=tk.DISABLED)
+        self.pause_btn.pack(fill=tk.X)
+
+        self._divider(inner)
+
+        # ── Record ─────────────────────────────────
+        self._section_header(inner, "RECORDING  (camera only)")
+        self.rec_timer_lbl = tk.Label(inner, text="", bg=PANEL, fg=REDL,
+                                       font=('Courier', 9, 'bold'))
+        self.rec_timer_lbl.pack(pady=(2, 2))
+        self.rec_btn = self._flat_btn(inner, "⏺   RECORD",
+                                       self._toggle_rec, PANEL, MUTED, INSET,
+                                       state=tk.DISABLED)
         self.rec_btn.pack(fill=tk.X, padx=12, pady=(0, 8))
 
-    # ── UI helpers ────────────────────────────────────────────
+        # ── Debug ──────────────────────────────────
+        self._divider(inner)
+        self._section_header(inner, "DEBUG")
+        self._debug_active = False
+        self._debug_btn = self._flat_btn(
+            inner, "⬤  START DEBUG", self._on_debug_toggle,
+            PANEL, TEXT2, INSET, state=tk.DISABLED)
+        self._debug_btn.pack(fill=tk.X, padx=12, pady=(0, 4))
+        self._debug_lbl = tk.Label(inner, text="", bg=PANEL, fg=MUTED,
+                                    font=('Courier', 8))
+        self._debug_lbl.pack(pady=(0, 10))
 
-    def _section(self, p, title):
-        tk.Label(p, text=title, bg='#252525', fg='#555',
-                 font=('Arial', 8, 'bold')).pack(anchor=tk.W, padx=12, pady=(8, 2))
+        # ── Camera feed ────────────────────────────
+        feed = tk.Frame(self.root, bg='#060E16')
+        feed.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.camera_label = tk.Label(feed, bg='#060E16', cursor='crosshair')
+        self.camera_label.pack(fill=tk.BOTH, expand=True)
+        self.camera_label.bind('<Button-1>', self._on_feed_click)
 
-    def _sep(self, p):
-        tk.Frame(p, bg='#3a3a3a', height=1).pack(fill=tk.X, padx=8, pady=4)
-
-    def _dot(self, parent, label):
-        tk.Label(parent, text=f"{label}:", bg='#252525', fg='#555',
-                 font=('Arial', 8), width=8, anchor=tk.W).pack(side=tk.LEFT)
-        lbl = tk.Label(parent, text="● Off", bg='#252525', fg='#555', font=('Arial', 8))
-        lbl.pack(side=tk.LEFT, padx=(0, 12))
-        return lbl
-
-    def _rb(self):
-        return dict(bg='#252525', fg='#ccc', selectcolor='#444',
-                    activebackground='#252525', activeforeground='white',
-                    font=('Arial', 9))
-
-    # ── Source ────────────────────────────────────────────────
+    # ── Source ─────────────────────────────────────
 
     def _set_source(self, value):
         if self.input_mode.get() == value:
@@ -324,14 +521,14 @@ class EyeTrackingApp:
 
     def _update_tabs(self):
         cam = self.input_mode.get() == 'camera'
-        self._cam_tab.config(bg='#0d6efd' if cam  else '#2a2a2a',
-                             fg='white'   if cam  else '#555',
-                             activebackground='#0a58ca' if cam else '#333',
-                             activeforeground='white')
-        self._vid_tab.config(bg='#fd7e14' if not cam else '#2a2a2a',
-                             fg='white'   if not cam else '#555',
-                             activebackground='#e8680a' if not cam else '#333',
-                             activeforeground='white')
+        self._cam_tab.config(
+            bg=CYAN if cam else INSET, fg=CYAND if cam else MUTED,
+            activebackground=CYANL if cam else CARD,
+            activeforeground=CYAND)
+        self._vid_tab.config(
+            bg=AMBERB if not cam else INSET, fg=AMBERL if not cam else MUTED,
+            activebackground=AMBERL if not cam else CARD,
+            activeforeground=AMBERB)
 
     def _toggle_video_panel(self):
         if self.input_mode.get() == 'video':
@@ -347,46 +544,49 @@ class EyeTrackingApp:
         if path:
             self.video_path.set(path)
 
-    # ── Zoom / Pan ────────────────────────────────────────────
-
-    def _on_zoom(self, val):
-        self.zoom_lbl.config(text=f"{float(val):.1f}x")
-        if float(val) <= 1.0:
-            self._zoom_pan_reset()
-
-    def _zoom_pan(self, dx, dy):
-        self.zoom_offset_x.set(self.zoom_offset_x.get() + dx)
-        self.zoom_offset_y.set(self.zoom_offset_y.get() + dy)
-        self.zpan_lbl.config(text=f"Pan view: X:{self.zoom_offset_x.get()}  Y:{self.zoom_offset_y.get()}")
-
-    def _zoom_pan_reset(self):
-        self.zoom_offset_x.set(0)
-        self.zoom_offset_y.set(0)
-        self.zpan_lbl.config(text="Pan view: X:0  Y:0")
+    # ── Zoom / Pan ─────────────────────────────────
 
     def _pan(self, dx, dy):
-        self.center_x.set(max(0, min(640, self.center_x.get() + dx)))
-        self.center_y.set(max(0, min(480, self.center_y.get() + dy)))
-        self.pos_lbl.config(text=f"X: {self.center_x.get()}   Y: {self.center_y.get()}")
+        x = max(0, min(self._frame_w, self.center_x.get() + dx))
+        y = max(0, min(self._frame_h, self.center_y.get() + dy))
+        self.center_x.set(x)
+        self.center_y.set(y)
+        self.pos_lbl.config(text=f"X: {x:4d}   Y: {y:4d}")
 
     def _pan_reset(self):
-        self.center_x.set(320)
-        self.center_y.set(240)
-        self.pos_lbl.config(text="X: 320   Y: 240")
+        x, y = self._frame_w // 2, self._frame_h // 2
+        self.center_x.set(x)
+        self.center_y.set(y)
+        self.pos_lbl.config(text=f"X: {x:4d}   Y: {y:4d}")
 
-    # ── Pause ─────────────────────────────────────────────────
+    def _on_feed_click(self, event):
+        lw = self.camera_label.winfo_width()
+        lh = self.camera_label.winfo_height()
+        disp_w = int(self._frame_w * self._display_scale)
+        disp_h = int(self._frame_h * self._display_scale)
+        ox = (lw - disp_w) // 2
+        oy = (lh - disp_h) // 2
+        fx = int((event.x - ox) / self._display_scale)
+        fy = int((event.y - oy) / self._display_scale)
+        fx = max(0, min(self._frame_w, fx))
+        fy = max(0, min(self._frame_h, fy))
+        self.center_x.set(fx)
+        self.center_y.set(fy)
+        self.pos_lbl.config(text=f"X: {fx:4d}   Y: {fy:4d}")
+
+    # ── Pause ──────────────────────────────────────
 
     def _toggle_pause(self):
         if self.pause_event.is_set():
             self.pause_event.clear()
-            self.pause_btn.config(text="▶  RESUME", bg='#fd7e14',
-                                  fg='white', activebackground='#e8680a')
+            self.pause_btn.config(text="▶   RESUME", bg=AMBERB, fg=AMBERL,
+                                  activebackground=AMBERL, activeforeground=AMBERB)
         else:
             self.pause_event.set()
-            self.pause_btn.config(text="⏸  PAUSE", bg='#fd7e14',
-                                  fg='white', activebackground='#e8680a')
+            self.pause_btn.config(text="⏸   PAUSE", bg=AMBERB, fg=AMBERL,
+                                  activebackground=AMBERL, activeforeground=AMBERB)
 
-    # ── Progress ──────────────────────────────────────────────
+    # ── Progress ───────────────────────────────────
 
     def _on_seek(self, val):
         if self._video_total_frames > 0 and not self._seeking and self.capture:
@@ -409,7 +609,7 @@ class EyeTrackingApp:
         h, m = divmod(m, 60)
         return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-    # ── Recording ─────────────────────────────────────────────
+    # ── Recording ──────────────────────────────────
 
     def _toggle_rec(self):
         if not self.capture or not self.capture._recording:
@@ -424,15 +624,15 @@ class EyeTrackingApp:
         self.capture.start_recording(path)
         self._rec_path = path
         self._rec_start_time = time.time()
-        self.rec_btn.config(text="⏹  STOP REC", bg='#dc3545',
-                            fg='white', activebackground='#b02a37')
+        self.rec_btn.config(text="⏹   STOP REC", bg=REDB, fg=REDL,
+                            activebackground=REDB, activeforeground=REDL)
         self._tick_rec()
 
     def _stop_rec(self):
         if self.capture:
             self.capture.stop_recording()
-        self.rec_btn.config(text="⏺  REC", bg='#444',
-                            fg='#888', activebackground='#555')
+        self.rec_btn.config(text="⏺   RECORD", bg=PANEL, fg=MUTED,
+                            activebackground=INSET, activeforeground=TEXT2)
         self.rec_timer_lbl.config(text="")
         if self._rec_path:
             self.video_path.set(self._rec_path)
@@ -446,7 +646,104 @@ class EyeTrackingApp:
         self.rec_timer_lbl.config(text=f"● REC  {m:02d}:{s:02d}")
         self.root.after(1000, self._tick_rec)
 
-    # ── Start / Stop ──────────────────────────────────────────
+    # ── Debug toggle ───────────────────────────────
+
+    def _on_debug_toggle(self):
+        if not self.capture or not self.capture.running:
+            return
+        import datetime
+        if not self._debug_active:
+            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            folder = os.path.join(os.path.dirname(__file__),
+                                  'debug', f'session_{ts}')
+            os.makedirs(folder, exist_ok=True)
+            self.capture._debug_folder   = folder
+            self.capture._debug_frame_idx = 0
+            self.capture.debug_enabled   = True
+            self._debug_active = True
+            self._debug_btn.config(text="⬛  STOP DEBUG",
+                                   bg=AMBERB, fg=AMBERL,
+                                   activebackground=AMBERB, activeforeground=AMBERL)
+            self._debug_lbl.config(
+                text=f"→ debug/session_{ts}", fg=AMBERL)
+        else:
+            self.capture.debug_enabled = False
+            self._debug_active = False
+            self._debug_btn.config(text="⬤  START DEBUG",
+                                   bg=PANEL, fg=TEXT2,
+                                   activebackground=INSET, activeforeground=TEXT)
+            self._debug_lbl.config(text="saved", fg=GREENL)
+
+    # ── Detection method ───────────────────────────
+
+    def _set_detect(self, method):
+        self.detect_method.set(method)
+        self._update_detect_tabs()
+
+    def _update_detect_tabs(self):
+        fm = self.detect_method.get() == 'facemesh'
+        self._fm_tab.config(
+            bg=CYAN if fm else INSET, fg=CYAND if fm else MUTED,
+            activebackground=CYANL, activeforeground=CYAND)
+        self._fp_tab.config(
+            bg=CYAN if not fm else INSET, fg=CYAND if not fm else MUTED,
+            activebackground=CYANL, activeforeground=CYAND)
+
+    # ── Precision indicator ────────────────────────
+
+    def _update_precision(self, iris_px):
+        if iris_px is None or iris_px <= 0:
+            self._iris_px_lbl.config(text="— px",     fg=MUTED)
+            self._precision_lbl.config(text="— mm/px", fg=MUTED)
+            self._px2mm_lbl.config(text="— px",       fg=MUTED)
+            return
+        mm_per_px   = config.IRIS_MM / iris_px
+        px_per_2mm  = 2.0 / mm_per_px
+        if mm_per_px < 0.20:
+            color, badge = GREENL, "GOOD"
+        elif mm_per_px < 0.40:
+            color, badge = CYANL,  "OK"
+        elif mm_per_px < 0.60:
+            color, badge = AMBERL, "LOW"
+        else:
+            color, badge = REDL,   "POOR"
+        self._iris_px_lbl.config(
+            text=f"{iris_px} px", fg=color)
+        self._precision_lbl.config(
+            text=f"{mm_per_px:.2f} mm/px  [{badge}]", fg=color)
+        self._px2mm_lbl.config(
+            text=f"{px_per_2mm:.1f} px", fg=color)
+
+    def _update_deviation(self, deviation_mm):
+        if deviation_mm is None:
+            self._dev_lbl.config(text="— mm", fg=MUTED)
+            return
+        thr = self._p.get('threshold_mm', 3.0)
+        if deviation_mm <= thr * 0.5:
+            color = GREENL
+        elif deviation_mm <= thr:
+            color = AMBERL
+        else:
+            color = REDL
+        self._dev_lbl.config(text=f"{deviation_mm:.2f} mm", fg=color)
+
+    # ── Beam indicator ─────────────────────────────
+
+    def _beam_on(self):
+        self._beam_frame.config(bg=REDB)
+        self._beam_dot.config(bg=REDB)
+        self._beam_dot.itemconfig(self._beam_oval, fill=REDL)
+        self.beam_lbl.config(text="BEAM ACTIVE", bg=REDB, fg=REDL)
+        self._beam_sub.config(text="Shutter: Open", bg=REDB, fg=REDL)
+
+    def _beam_off(self):
+        self._beam_frame.config(bg=CARD)
+        self._beam_dot.config(bg=CARD)
+        self._beam_dot.itemconfig(self._beam_oval, fill=MUTED)
+        self.beam_lbl.config(text="BEAM OFF", bg=CARD, fg=MUTED)
+        self._beam_sub.config(text="Shutter: Closed", bg=CARD, fg=MUTED)
+
+    # ── Start / Stop ───────────────────────────────
 
     def start(self):
         is_video = self.input_mode.get() == 'video'
@@ -459,51 +756,50 @@ class EyeTrackingApp:
             self.cap = cv2.VideoCapture(path)
             if not self.cap.isOpened():
                 messagebox.showerror("Error", f"Cannot open video:\n{path}")
-                self.source_status.config(text="● Off", fg='#555')
+                self._led_set(self._cam_led, False)
                 return
         else:
             self.cap = cv2.VideoCapture(0)
             if not self.cap.isOpened():
-                self.source_status.config(text="● Off", fg='#555')
+                self._led_set(self._cam_led, False)
                 return
 
         self._video_fps          = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self._video_total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        self.source_status.config(text="● On", fg='#28a745')
+        self._led_set(self._cam_led, True)
         self.pause_event.set()
 
         self.capture = CaptureThread(
-            cap=self.cap,
-            params=self._p,
-            arduino=self.arduino,
-            is_video=is_video,
-            fps=self._video_fps,
+            cap=self.cap, params=self._p, arduino=self.arduino,
+            is_video=is_video, fps=self._video_fps,
             total_frames=self._video_total_frames,
-            frame_queue=self.frame_queue,
-            pause_event=self.pause_event,
+            frame_queue=self.frame_queue, pause_event=self.pause_event,
             on_video_end=lambda: self.root.after(0, self.stop),
             on_progress=self._on_progress,
         )
         self.capture.start()
 
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self.start_btn.config(state=tk.DISABLED, bg=MUTED, fg=PANEL)
+        self.stop_btn.config(state=tk.NORMAL, bg=REDB, fg=REDL,
+                             activebackground=REDB, activeforeground=REDL)
+        self._debug_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
+                               activebackground=INSET, activeforeground=TEXT)
 
         if is_video:
-            self.pause_btn.config(text="⏸  PAUSE", state=tk.NORMAL,
-                                  bg='#fd7e14', fg='white',
-                                  activebackground='#e8680a')
+            self.pause_btn.config(text="⏸   PAUSE", state=tk.NORMAL,
+                                  bg=AMBERB, fg=AMBERL,
+                                  activebackground=AMBERL, activeforeground=AMBERB)
             self.prog_slider.config(state=tk.NORMAL)
             self.prog_lbl.config(
                 text=f"00:00 / {self._fmt(self._video_total_frames / self._video_fps)}")
-            self.rec_btn.config(state=tk.DISABLED, bg='#444', fg='#888')
+            self.rec_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTED)
         else:
-            self.pause_btn.config(state=tk.DISABLED, bg='#444', fg='#888',
-                                  text="⏸  PAUSE")
+            self.pause_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTED,
+                                  text="⏸   PAUSE")
             self.prog_slider.config(state=tk.DISABLED)
-            self.rec_btn.config(state=tk.NORMAL, bg='#444', fg='#888',
-                                activebackground='#555')
+            self.rec_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
+                                activebackground=INSET, activeforeground=TEXT)
 
         self._update_frame()
 
@@ -512,42 +808,55 @@ class EyeTrackingApp:
             self.capture.stop_recording()
             self.capture.stop()
             self.capture = None
-
         if self.cap:
             self.cap.release()
             self.cap = None
 
         self.arduino.send(b'B0\n')
+        self._beam_off()
 
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.pause_btn.config(text="⏸  PAUSE", state=tk.DISABLED,
-                              bg='#444', fg='#888')
+        self.start_btn.config(state=tk.NORMAL, bg=CYAN, fg=CYAND)
+        self.stop_btn.config(state=tk.DISABLED, bg=CARD, fg=TEXT2,
+                             activebackground=INSET, activeforeground=TEXT2)
+        self.pause_btn.config(text="⏸   PAUSE", state=tk.DISABLED,
+                              bg=PANEL, fg=MUTED)
         self.prog_slider.config(state=tk.DISABLED)
-        self.rec_btn.config(text="⏺  REC", state=tk.DISABLED,
-                            bg='#444', fg='#888')
+        self.rec_btn.config(text="⏺   RECORD", state=tk.DISABLED,
+                            bg=PANEL, fg=MUTED)
         self.rec_timer_lbl.config(text="")
-        self.beam_lbl.config(text="BEAM OFF", bg='#333', fg='#888')
-        self.camera_label.config(image='', bg='black')
-        self.source_status.config(text="● Off", fg='#555')
+        if self._debug_active:
+            self._debug_active = False
+        self._debug_btn.config(text="⬤  START DEBUG", state=tk.DISABLED,
+                               bg=PANEL, fg=MUTED)
+        self._debug_lbl.config(text="")
+        self.camera_label.config(image='', bg='#060E16')
+        self._led_set(self._cam_led, False)
+        self._update_precision(None)
+        self._update_deviation(None)
         self.video_progress.set(0)
         self.prog_lbl.config(text="--:-- / --:--")
 
-    # ── Frame display ─────────────────────────────────────────
+    # ── Frame display ──────────────────────────────
 
     def _update_frame(self):
         if not self.capture or not self.capture.running:
             return
         try:
-            frame, state = self.frame_queue.get_nowait()
-            self.beam_lbl.config(
-                text="BEAM ON"  if state == 'O' else "BEAM OFF",
-                bg  ='#dc3545' if state == 'O' else '#333',
-                fg  ='white'   if state == 'O' else '#888')
+            frame, state, metrics = self.frame_queue.get_nowait()
+            if state == 'O':
+                self._beam_on()
+            else:
+                self._beam_off()
+            self._update_precision(metrics.get('iris_px'))
+            self._update_deviation(metrics.get('deviation_mm'))
+            self._frame_h, self._frame_w = frame.shape[:2]
             w = max(self.camera_label.winfo_width(),  640)
             h = max(self.camera_label.winfo_height(), 480)
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             scale = min(w / img.width, h / img.height)
+            self._display_scale = scale
+            self._display_ox = (w - int(img.width  * scale)) // 2
+            self._display_oy = (h - int(img.height * scale)) // 2
             img = img.resize((int(img.width * scale), int(img.height * scale)),
                              Image.LANCZOS)
             tk_img = ImageTk.PhotoImage(image=img)
@@ -557,7 +866,7 @@ class EyeTrackingApp:
             pass
         self.root.after(30, self._update_frame)
 
-    # ── Close ─────────────────────────────────────────────────
+    # ── Close ──────────────────────────────────────
 
     def on_close(self):
         self.stop()

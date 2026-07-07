@@ -43,11 +43,10 @@ eye_tracking/
 ### `capture.py` — `CaptureThread`
 - รันใน background thread แยกต่างหาก
 - อ่านค่าจาก `params` dict เท่านั้น (ไม่เรียก tkinter เลย)
-- **Zoom + Pan**: crop frame ตาม offset ก่อน resize
 - **MediaPipe detection**: สร้าง `FaceMesh` ใน thread นี้เอง (ป้องกัน OpenGL segfault)
   - คำนวณ EAR (Eye Aspect Ratio) — หากกะพริบตา → ปิด beam
-  - คำนวณ iris overlap กับ green circle — หาก ≥ 70% → เปิด beam
-- **Fallback**: ถ้าไม่มี MediaPipe ใช้ HoughCircles แทน
+  - คำนวณระยะเบี่ยงเบนของ iris/pupil จากจุดศูนย์กลาง (mm) โดยแปลง px→mm จากขนาด iris — หากอยู่ในค่า threshold ที่ตั้งไว้ → เปิด beam
+- **ไม่มี MediaPipe**: ปิด beam ตลอด (ไม่มี fallback detection)
 - **Recording**: บันทึก raw frame (ก่อนวาด annotation) ไปยัง `video/`
 - ส่ง progress กลับผ่าน callback (`root.after`) — thread-safe
 
@@ -55,6 +54,21 @@ eye_tracking/
 - `connect_async()`: เชื่อมต่อ serial port ใน background thread พร้อม callback เมื่อเสร็จ
 - `send(msg)`: ส่งคำสั่งผ่าน serial พร้อม lock
 - คำสั่งที่ใช้: `B1\n` = เปิด beam, `B0\n` = ปิด beam
+- Arduino ส่ง `READY\n` ตอน boot เพื่อยืนยัน connection (ป้องกัน false positive จาก device อื่น)
+
+---
+
+## Arduino / Hardware
+
+| รายการ | ค่า |
+|---|---|
+| Board | Arduino Mega 2560 Pro |
+| Serial Port | `/dev/ttyUSB1` (เสียบ USB ช่องเดิมทุกครั้ง) |
+| Baud Rate | 9600 |
+| **Relay Pin** | **Digital Pin 4** |
+| Sketch | `arduino_sketch/eye_tracking_beam/eye_tracking_beam.ino` |
+
+> **หมายเหตุ**: Relay บน custom PCB ต่ออยู่กับ pin 4 — อย่าเปลี่ยน `BEAM_PIN` ใน sketch
 
 ---
 

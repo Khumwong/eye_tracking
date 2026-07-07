@@ -45,7 +45,7 @@ echo "[INFO] Installing mediapipe (optional)..."
 cat > "$SCRIPT_DIR/launch.sh" <<EOF
 #!/bin/bash
 cd "$SCRIPT_DIR"
-"$VENV_DIR/bin/python3" eye_tracking_gui.py
+"$VENV_DIR/bin/python3" main.py
 EOF
 chmod +x "$SCRIPT_DIR/launch.sh"
 echo "[OK] launch.sh updated"

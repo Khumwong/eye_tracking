@@ -1,8 +1,13 @@
+import collections
+import csv
 import cv2
 import numpy as np
-import math
+import os
 import time
 import threading
+
+import config
+import detection
 
 try:
     import mediapipe as mp
@@ -34,6 +39,18 @@ class CaptureThread:
         self.running = False
         self.current_state = 'S'
         self._seek = -1
+        self._last_iris_px      = None
+        self._last_iris_x       = None
+        self._last_iris_y       = None
+        self._last_deviation_mm = None
+
+        self._strip_deque = collections.deque(maxlen=100)
+
+        self.debug_enabled   = False
+        self._debug_folder   = None
+        self._debug_frame_idx = 0
+        self._csv_file       = None
+        self._csv_writer_obj = None
 
         self._recording = False
         self._writer = None
@@ -106,18 +123,32 @@ class CaptureThread:
                 if not self.is_video:
                     frame = cv2.flip(frame, 1)
 
-                frame = self._zoom(frame)
                 raw = frame.copy()
 
-                r  = self.params.get('radius', 50)
-                cx = self.params.get('cx', 320)
-                cy = self.params.get('cy', 240)
+                r  = self.params.get('radius', config.DEFAULT_RADIUS)
+                cx = self.params.get('cx', config.DEFAULT_CENTER[0])
+                cy = self.params.get('cy', config.DEFAULT_CENTER[1])
                 center = (cx, cy)
 
+                self._last_iris_px      = None
+                self._last_iris_x       = None
+                self._last_iris_y       = None
+                self._last_deviation_mm = None
                 if face_mesh:
-                    trigger = self._detect_mp(frame, center, r, face_mesh)
+                    if self.params.get('detect_method') == 'facemesh_pupil':
+                        result = self._detect_mp_pupil(frame, center, face_mesh)
+                    else:
+                        result = self._detect_mp(frame, center, face_mesh)
                 else:
-                    trigger = self._detect_hough(frame, center, r)
+                    result = None
+                trigger = result is True   # None (no face) or False (blink) → beam off
+
+                # strip chart (always visible)
+                self._strip_deque.append(self._last_deviation_mm)
+                self._draw_strip_chart(frame)
+
+                # debug CSV + crops
+                self._handle_debug(raw, trigger)
 
                 cv2.circle(frame, center, r, (0, 255, 0), 2)
 
@@ -128,9 +159,6 @@ class CaptureThread:
                     self.arduino.send(b'B0\n')
                     self.current_state = 'S'
 
-                label = "Open the shutter!" if self.current_state == 'O' else "Searching..."
-                col   = (0, 0, 255) if self.current_state == 'O' else (0, 200, 0)
-                cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, col, 2)
 
                 if self.is_video and self._total > 0 and self._seek < 0:
                     cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
@@ -145,7 +173,13 @@ class CaptureThread:
                             self._writer.write(raw)
 
                 if not self.queue.full():
-                    self.queue.put((frame, self.current_state))
+                    metrics = {
+                        'iris_px':      self._last_iris_px,
+                        'iris_x':       self._last_iris_x,
+                        'iris_y':       self._last_iris_y,
+                        'deviation_mm': self._last_deviation_mm,
+                    }
+                    self.queue.put((frame, self.current_state, metrics))
 
                 if self.is_video:
                     dt = (frame_delay / self.params.get('speed', 1.0)) - (time.time() - t0)
@@ -154,85 +188,153 @@ class CaptureThread:
         finally:
             if face_mesh:
                 face_mesh.close()
-
-    # ── Zoom ──────────────────────────────────────────────────
-
-    def _zoom(self, frame):
-        z = self.params.get('zoom', 1.0)
-        if z <= 1.0:
-            return frame
-        h, w = frame.shape[:2]
-        nh, nw = int(h / z), int(w / z)
-        ox = self.params.get('zoom_ox', 0)
-        oy = self.params.get('zoom_oy', 0)
-        x1 = max(0, min(w - nw, w // 2 + ox - nw // 2))
-        y1 = max(0, min(h - nh, h // 2 + oy - nh // 2))
-        return cv2.resize(frame[y1:y1+nh, x1:x1+nw], (w, h),
-                          interpolation=cv2.INTER_LINEAR)
+            if self._csv_file:
+                self._csv_file.close()
+                self._csv_file = None
 
     # ── Detection ─────────────────────────────────────────────
 
-    def _detect_hough(self, frame, center, radius):
-        blurred = cv2.GaussianBlur(
-            cv2.bitwise_not(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)),
-            (9, 9), 0)
-        circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT,
-                                   dp=1.2, minDist=50, param1=50, param2=30,
-                                   minRadius=10, maxRadius=20)
-        if circles is not None:
-            for x, y, r in np.round(circles[0]).astype(int):
-                cv2.circle(frame, (x, y), r, (0, 0, 255), 2)
-                if (x - center[0])**2 + (y - center[1])**2 <= radius**2:
-                    return True
-        return False
+    def _within_threshold(self, ex, ey, ir, center):
+        """Return (triggered, deviation_mm). Uses iris size to convert px → mm."""
+        d_mm = detection.deviation_mm(ex, ey, ir, center)
+        self._last_deviation_mm = d_mm
+        thr = self.params.get('threshold_mm', config.DEFAULT_THRESHOLD_MM)
+        return d_mm <= thr, d_mm
 
-    def _detect_mp(self, frame, center, radius, face_mesh):
+    def _detect_mp_pupil(self, frame, center, face_mesh):
+        """FaceMesh for ROI + dark pupil detection for precise center."""
         results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         if not results.multi_face_landmarks:
-            return False
+            return None
         h, w = frame.shape[:2]
         side = self.params.get('side', 'left')
         for face in results.multi_face_landmarks:
-            if self._ear(face, h, w, side) < 0.20:
+            if detection.eye_aspect_ratio(face, h, w, side) < config.EAR_BLINK_THRESHOLD:
                 return False
-            ix, iy, ir = self._iris(face, h, w, side)
-            cv2.circle(frame, (ix, iy), ir, (0, 0, 255), 2)
-            if self._overlap(ix, iy, ir, center[0], center[1], radius) >= 0.85:
+            ix, iy, ir = detection.iris_from_landmarks(face, h, w, side)
+            self._last_iris_px = ir * 2
+            self._last_iris_x  = ix
+            self._last_iris_y  = iy
+            pad = int(ir * 1.5)
+            x1, y1 = max(0, ix - pad), max(0, iy - pad)
+            x2, y2 = min(w, ix + pad), min(h, iy + pad)
+            roi = frame[y1:y2, x1:x2]
+            px_r, py_r, pr_r = detection.pupil_in_roi(roi) if roi.size > 0 else (None, None, None)
+            if px_r is not None:
+                px, py = x1 + px_r, y1 + py_r
+                cv2.circle(frame, (ix, iy), ir,   (100, 100, 255), 1)
+                cv2.circle(frame, (px, py), pr_r,  (0,   0,   255), 2)
+                ok, _ = self._within_threshold(px, py, ir, center)
+            else:
+                cv2.circle(frame, (ix, iy), ir, (0, 0, 255), 2)
+                ok, _ = self._within_threshold(ix, iy, ir, center)
+            if ok:
                 return True
         return False
 
-    @staticmethod
-    def _iris(lms, h, w, side):
-        ci = 468 if side == 'left' else 473
-        bi = [469, 470, 471, 472] if side == 'left' else [474, 475, 476, 477]
-        lm = lms.landmark
-        cx = int(lm[ci].x * w)
-        cy = int(lm[ci].y * h)
-        r = int(np.mean([math.hypot(lm[i].x*w - cx, lm[i].y*h - cy) for i in bi]))
-        return cx, cy, max(r, 1)
+    def _detect_mp(self, frame, center, face_mesh):
+        results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if not results.multi_face_landmarks:
+            return None  # no face → beam off
+        h, w = frame.shape[:2]
+        side = self.params.get('side', 'left')
+        for face in results.multi_face_landmarks:
+            if detection.eye_aspect_ratio(face, h, w, side) < config.EAR_BLINK_THRESHOLD:
+                return False
+            ix, iy, ir = detection.iris_from_landmarks(face, h, w, side)
+            self._last_iris_px = ir * 2
+            self._last_iris_x  = ix
+            self._last_iris_y  = iy
+            cv2.circle(frame, (ix, iy), ir, (0, 0, 255), 2)
+            ok, _ = self._within_threshold(ix, iy, ir, center)
+            if ok:
+                return True
+        return False
 
-    @staticmethod
-    def _ear(lms, h, w, side):
-        idx = ([362, 385, 387, 263, 373, 380] if side == 'left'
-               else [33, 160, 158, 133, 153, 144])
-        lm = lms.landmark
-        pts = [(lm[i].x*w, lm[i].y*h) for i in idx]
-        v1 = math.hypot(pts[1][0]-pts[5][0], pts[1][1]-pts[5][1])
-        v2 = math.hypot(pts[2][0]-pts[4][0], pts[2][1]-pts[4][1])
-        hz = math.hypot(pts[0][0]-pts[3][0], pts[0][1]-pts[3][1])
-        return (v1 + v2) / (2.0 * hz) if hz > 0 else 0.0
+    def _draw_strip_chart(self, frame):
+        vals = list(self._strip_deque)
+        if not vals:
+            return
+        fh, fw = frame.shape[:2]
+        CW, CH = 200, 60
+        x0, y0 = 8, fh - CH - 8
+        sub = frame[y0:y0+CH, x0:x0+CW]
+        np.multiply(sub, 0.35, out=sub, casting='unsafe')
+        frame[y0:y0+CH, x0:x0+CW] = sub
 
-    @staticmethod
-    def _overlap(ix, iy, ir, gx, gy, gr):
-        d = math.hypot(ix-gx, iy-gy)
-        if d + ir <= gr:
-            return 1.0
-        if d >= ir + gr:
-            return 0.0
-        ca = max(-1.0, min(1.0, (d*d + ir*ir - gr*gr) / (2*d*ir)))
-        cb = max(-1.0, min(1.0, (d*d + gr*gr - ir*ir) / (2*d*gr)))
-        a = math.acos(ca)
-        b = math.acos(cb)
-        area = (ir*ir * (a - math.sin(a)*math.cos(a)) +
-                gr*gr * (b - math.sin(b)*math.cos(b)))
-        return area / (math.pi * ir * ir)
+        thr   = self.params.get('threshold_mm', config.DEFAULT_THRESHOLD_MM)
+        y_max = max(thr * 2, 6.0)
+        thr_y = y0 + CH - 2 - int((thr / y_max) * (CH - 4))
+        cv2.line(frame, (x0, thr_y), (x0 + CW, thr_y), (80, 80, 200), 1)
+
+        n = len(vals)
+        pts = []
+        for i, v in enumerate(vals):
+            if v is None:
+                continue
+            px = x0 + int(i / max(n - 1, 1) * (CW - 1))
+            py = y0 + CH - 2 - int(min(v, y_max) / y_max * (CH - 4))
+            pts.append((px, py, v))
+        for k in range(1, len(pts)):
+            x1, y1, _ = pts[k-1]
+            x2, y2, v = pts[k]
+            color = (50, 200, 50) if v <= thr else (80, 80, 220)
+            cv2.line(frame, (x1, y1), (x2, y2), color, 1)
+
+        last_v = next((v for _, _, v in reversed(pts)), None)
+        if last_v is not None:
+            col = (50, 220, 50) if last_v <= thr else (80, 80, 220)
+            cv2.putText(frame, f"{last_v:.2f}mm",
+                        (x0 + 3, y0 + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
+        cv2.putText(frame, f"thr:{thr:.1f}",
+                    (x0 + 3, y0 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (120, 120, 200), 1)
+
+    def _handle_debug(self, raw, trigger):
+        if not self.debug_enabled or self._debug_folder is None:
+            if self._csv_file is not None:
+                self._csv_file.close()
+                self._csv_file = None
+                self._csv_writer_obj = None
+            return
+
+        if self._csv_file is None:
+            csv_path = os.path.join(self._debug_folder, 'log.csv')
+            self._csv_file = open(csv_path, 'w', newline='')
+            self._csv_writer_obj = csv.writer(self._csv_file)
+            self._csv_writer_obj.writerow(
+                ['frame', 'timestamp', 'iris_x', 'iris_y', 'iris_px',
+                 'deviation_mm', 'triggered'])
+
+        self._csv_writer_obj.writerow([
+            self._debug_frame_idx,
+            f"{time.time():.4f}",
+            self._last_iris_x  if self._last_iris_x  is not None else '',
+            self._last_iris_y  if self._last_iris_y  is not None else '',
+            self._last_iris_px if self._last_iris_px is not None else '',
+            f"{self._last_deviation_mm:.4f}" if self._last_deviation_mm is not None else '',
+            1 if trigger else 0,
+        ])
+
+        if self._last_iris_x is not None and self._debug_frame_idx % 3 == 0:
+            self._save_debug_crop(raw, self._debug_frame_idx)
+
+        self._debug_frame_idx += 1
+
+    def _save_debug_crop(self, raw, frame_idx):
+        ix, iy = self._last_iris_x, self._last_iris_y
+        ir  = (self._last_iris_px // 2) if self._last_iris_px else 20
+        pad = max(int(ir * 2.5), 30)
+        fh, fw = raw.shape[:2]
+        x1, y1 = max(0, ix - pad), max(0, iy - pad)
+        x2, y2 = min(fw, ix + pad), min(fh, iy + pad)
+        crop = raw[y1:y2, x1:x2].copy()
+        if crop.size == 0:
+            return
+        cx_r, cy_r = ix - x1, iy - y1
+        cv2.circle(crop, (cx_r, cy_r), ir, (0, 0, 255), 1)
+        cv2.circle(crop, (cx_r, cy_r), 2, (0, 255, 255), -1)
+        if self._last_deviation_mm is not None:
+            cv2.putText(crop, f"{self._last_deviation_mm:.2f}mm",
+                        (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        path = os.path.join(self._debug_folder, f"crop_{frame_idx:05d}.jpg")
+        cv2.imwrite(path, crop, [cv2.IMWRITE_JPEG_QUALITY, 85])

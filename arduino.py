@@ -20,11 +20,17 @@ class ArduinoController:
                 on_done(False)
                 return
             try:
-                s = serial.Serial(port, baud, timeout=1)
-                time.sleep(2)
-                with self._lock:
-                    self._serial = s
-                on_done(True)
+                s = serial.Serial(port, baud, timeout=3)
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    line = s.readline().decode('ascii', errors='ignore').strip()
+                    if line == 'READY':
+                        with self._lock:
+                            self._serial = s
+                        on_done(True)
+                        return
+                s.close()
+                on_done(False)
             except Exception:
                 on_done(False)
         threading.Thread(target=_work, daemon=True).start()
@@ -36,6 +42,11 @@ class ArduinoController:
                     self._serial.write(msg)
                 except Exception:
                     pass
+
+    @property
+    def is_connected(self):
+        with self._lock:
+            return bool(self._serial and self._serial.is_open)
 
     def close(self):
         with self._lock:

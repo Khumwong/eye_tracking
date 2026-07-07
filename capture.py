@@ -125,7 +125,6 @@ class CaptureThread:
 
                 raw = frame.copy()
 
-                r  = self.params.get('radius', config.DEFAULT_RADIUS)
                 cx = self.params.get('cx', config.DEFAULT_CENTER[0])
                 cy = self.params.get('cy', config.DEFAULT_CENTER[1])
                 center = (cx, cy)
@@ -150,7 +149,7 @@ class CaptureThread:
                 # debug CSV + crops
                 self._handle_debug(raw, trigger)
 
-                cv2.circle(frame, center, r, (0, 255, 0), 2)
+                self._draw_target(frame, center, trigger)
 
                 if trigger and self.current_state != 'O':
                     self.arduino.send(b'B1\n')
@@ -192,6 +191,23 @@ class CaptureThread:
                 self._csv_file.close()
                 self._csv_file = None
 
+    # ── Target overlay ────────────────────────────────────────
+
+    def _draw_target(self, frame, center, trigger):
+        """Fixed crosshair at the target point + a threshold circle sized
+        from the live iris measurement — so the drawn circle always matches
+        the real accept radius, instead of an arbitrary fixed pixel radius."""
+        cx, cy = center
+        s = config.TARGET_MARK_PX
+        cv2.line(frame, (cx - s, cy), (cx + s, cy), (0, 255, 0), 1)
+        cv2.line(frame, (cx, cy - s), (cx, cy + s), (0, 255, 0), 1)
+
+        if self._last_iris_px:
+            thr_mm = self.params.get('threshold_mm', config.DEFAULT_THRESHOLD_MM)
+            r_px = int(thr_mm * self._last_iris_px / config.IRIS_MM)
+            color = (50, 200, 50) if trigger else (80, 80, 220)
+            cv2.circle(frame, center, max(r_px, 2), color, 1)
+
     # ── Detection ─────────────────────────────────────────────
 
     def _within_threshold(self, ex, ey, ir, center):
@@ -224,9 +240,11 @@ class CaptureThread:
                 px, py = x1 + px_r, y1 + py_r
                 cv2.circle(frame, (ix, iy), ir,   (100, 100, 255), 1)
                 cv2.circle(frame, (px, py), pr_r,  (0,   0,   255), 2)
+                cv2.circle(frame, (px, py), config.DETECTED_MARK_PX, (0, 255, 255), -1)
                 ok, _ = self._within_threshold(px, py, ir, center)
             else:
                 cv2.circle(frame, (ix, iy), ir, (0, 0, 255), 2)
+                cv2.circle(frame, (ix, iy), config.DETECTED_MARK_PX, (0, 255, 255), -1)
                 ok, _ = self._within_threshold(ix, iy, ir, center)
             if ok:
                 return True
@@ -246,6 +264,7 @@ class CaptureThread:
             self._last_iris_x  = ix
             self._last_iris_y  = iy
             cv2.circle(frame, (ix, iy), ir, (0, 0, 255), 2)
+            cv2.circle(frame, (ix, iy), config.DETECTED_MARK_PX, (0, 255, 255), -1)
             ok, _ = self._within_threshold(ix, iy, ir, center)
             if ok:
                 return True

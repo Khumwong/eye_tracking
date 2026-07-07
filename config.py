@@ -10,9 +10,12 @@ IRIS_MM             = 11.0   # average human iris diameter (mm), used for px→m
 EAR_BLINK_THRESHOLD = 0.20   # eye aspect ratio below this = eyes closed (blink)
 
 # ── Defaults (initial UI state / CaptureThread params) ──
-DEFAULT_RADIUS       = 50
 DEFAULT_CENTER       = (320, 240)
 DEFAULT_THRESHOLD_MM = 3.0
+
+# ── Target overlay ───────────────────────────────────
+TARGET_MARK_PX   = 8   # half-length of the fixed crosshair at the target point
+DETECTED_MARK_PX = 3   # radius of the dot marking the measured eye position
 
 # ── Arduino ──────────────────────────────────────────
 ARDUINO_BAUD = 9600

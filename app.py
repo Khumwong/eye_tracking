@@ -33,7 +33,6 @@ class EyeTrackingApp:
         self.arduino = ArduinoController()
 
         self.eye_side       = tk.StringVar(value='left')
-        self.circle_radius  = tk.IntVar(value=config.DEFAULT_RADIUS)
         self.center_x       = tk.IntVar(value=config.DEFAULT_CENTER[0])
         self.center_y       = tk.IntVar(value=config.DEFAULT_CENTER[1])
         self.detect_method  = tk.StringVar(value='facemesh')
@@ -57,7 +56,6 @@ class EyeTrackingApp:
         self._frame_h       = 480
 
         self._p: dict = {
-            'radius': config.DEFAULT_RADIUS,
             'cx': config.DEFAULT_CENTER[0], 'cy': config.DEFAULT_CENTER[1],
             'side': 'left', 'speed': 1.0, 'loop': True,
             'detect_method': 'facemesh', 'threshold_mm': config.DEFAULT_THRESHOLD_MM,
@@ -71,7 +69,6 @@ class EyeTrackingApp:
 
     def _wire_params(self):
         def s(k, v): self._p[k] = v.get()
-        self.circle_radius.trace_add( 'write', lambda *_: s('radius',  self.circle_radius))
         self.center_x.trace_add(      'write', lambda *_: s('cx',      self.center_x))
         self.center_y.trace_add(      'write', lambda *_: s('cy',      self.center_y))
         self.eye_side.trace_add(      'write', lambda *_: s('side',          self.eye_side))
@@ -175,17 +172,13 @@ class EyeTrackingApp:
         lbl.pack(side=tk.RIGHT)
         return lbl
 
-    def _nav_pad(self, parent, up_cmd, dn_cmd, lt_cmd, rt_cmd, rst_cmd):
+    def _reset_button(self, parent, cmd):
         f = tk.Frame(parent, bg=PANEL)
         f.pack(pady=(2, 6))
-        s = dict(bg=CARD, fg=TEXT2, relief='flat', width=3,
-                 cursor='hand2', activebackground=INSET,
-                 activeforeground=CYANL, font=('Helvetica', 12), pady=3)
-        tk.Button(f, text="↑", command=up_cmd,  **s).grid(row=0, column=1, padx=2, pady=2)
-        tk.Button(f, text="←", command=lt_cmd,  **s).grid(row=1, column=0, padx=2, pady=2)
-        tk.Button(f, text="⊕", command=rst_cmd, **s).grid(row=1, column=1, padx=2, pady=2)
-        tk.Button(f, text="→", command=rt_cmd,  **s).grid(row=1, column=2, padx=2, pady=2)
-        tk.Button(f, text="↓", command=dn_cmd,  **s).grid(row=2, column=1, padx=2, pady=2)
+        tk.Button(f, text="⊕  Reset to center", command=cmd,
+                  bg=CARD, fg=TEXT2, relief='flat', cursor='hand2',
+                  activebackground=INSET, activeforeground=CYANL,
+                  font=('Helvetica', 10), padx=10, pady=4).pack()
 
     # ── Build UI ───────────────────────────────────
 
@@ -399,22 +392,6 @@ class EyeTrackingApp:
                  command=lambda v: self._thr_lbl.config(text=f"{float(v):.1f} mm")
                  ).pack(fill=tk.X, padx=12, pady=(0, 6))
 
-        # Radius
-        rrow = tk.Frame(inner, bg=PANEL)
-        rrow.pack(fill=tk.X, padx=12, pady=(2, 4))
-        tk.Label(rrow, text="Radius", bg=PANEL, fg=TEXT2,
-                 font=('Helvetica', 9)).pack(side=tk.LEFT)
-        self._r_lbl = tk.Label(rrow, text=" 50 px", bg=PANEL, fg=CYANL,
-                                font=('Courier', 10, 'bold'))
-        self._r_lbl.pack(side=tk.RIGHT)
-        self.circle_radius.trace_add('write', lambda *_: self._r_lbl.config(
-            text=f"{self.circle_radius.get():3d} px"))
-        sp = tk.Spinbox(inner, from_=10, to=300, textvariable=self.circle_radius,
-                        width=6, bg=INSET, fg=CYANL, buttonbackground=CARD,
-                        relief='flat', insertbackground=CYANL,
-                        font=('Courier', 10), justify='center')
-        sp.pack(fill=tk.X, padx=12, pady=(0, 6))
-
         self._divider(inner)
 
         # ── Target position ────────────────────────
@@ -422,12 +399,7 @@ class EyeTrackingApp:
         self.pos_lbl = tk.Label(inner, text="X: 320   Y: 240",
                                  bg=PANEL, fg=CYANL, font=('Courier', 10, 'bold'))
         self.pos_lbl.pack(pady=(2, 4))
-        self._nav_pad(inner,
-                      up_cmd=lambda: self._pan(0, -10),
-                      dn_cmd=lambda: self._pan(0,  10),
-                      lt_cmd=lambda: self._pan(-10, 0),
-                      rt_cmd=lambda: self._pan(10,  0),
-                      rst_cmd=self._pan_reset)
+        self._reset_button(inner, self._pan_reset)
 
         self._divider(inner)
 
@@ -545,13 +517,6 @@ class EyeTrackingApp:
             self.video_path.set(path)
 
     # ── Zoom / Pan ─────────────────────────────────
-
-    def _pan(self, dx, dy):
-        x = max(0, min(self._frame_w, self.center_x.get() + dx))
-        y = max(0, min(self._frame_h, self.center_y.get() + dy))
-        self.center_x.set(x)
-        self.center_y.set(y)
-        self.pos_lbl.config(text=f"X: {x:4d}   Y: {y:4d}")
 
     def _pan_reset(self):
         x, y = self._frame_w // 2, self._frame_h // 2

@@ -31,6 +31,8 @@ class EyeTrackingApp:
         self.pause_event.set()
 
         self.arduino = ArduinoController()
+        self.ready = False
+        self._cam_ok = False
 
         self.eye_side       = tk.StringVar(value='left')
         self.center_x       = tk.IntVar(value=config.DEFAULT_CENTER[0])
@@ -55,15 +57,23 @@ class EyeTrackingApp:
         self._frame_w       = 640
         self._frame_h       = 480
 
+        # 3-way view swap: wide / zoomed eye (color) / zoomed eye (grayscale
+        # cross-check). Whichever isn't main shows as a small clickable inset
+        # — click an inset to promote it to main; clicking the main view only
+        # adjusts the target, it never changes which view is main. See
+        # CaptureThread._compose_display.
+        self._last_view_meta = None
+
         self._p: dict = {
             'cx': config.DEFAULT_CENTER[0], 'cy': config.DEFAULT_CENTER[1],
             'side': 'left', 'speed': 1.0, 'loop': True,
             'detect_method': 'facemesh', 'threshold_mm': config.DEFAULT_THRESHOLD_MM,
+            'main_view': 'wide',
         }
         self._wire_params()
         self._build_ui()
         self.root.after(100, self._connect_arduino)
-        self.root.after(200, self._check_camera)
+        self.root.after(200, self._maybe_start_preview)
 
     # ── Param sync ─────────────────────────────────
 
@@ -79,13 +89,12 @@ class EyeTrackingApp:
 
     # ── Checks ─────────────────────────────────────
 
-    def _check_camera(self):
-        def _work():
-            cap = cv2.VideoCapture(0)
-            ok = cap.isOpened()
-            cap.release()
-            self.root.after(0, lambda: self._led_set(self._cam_led, ok))
-        threading.Thread(target=_work, daemon=True).start()
+    def _maybe_start_preview(self):
+        """Auto-open a live (unarmed) camera preview so Eye Selection, Threshold,
+        and Target Position can all be set by eye before READY/START are ever
+        touched — the beam relay stays gated off regardless (see CaptureThread.armed)."""
+        if self.input_mode.get() == 'camera' and not (self.capture and self.capture.running):
+            self._open_capture(armed=False)
 
     def _connect_arduino(self):
         def _on_done(ok):
@@ -155,6 +164,12 @@ class EyeTrackingApp:
     def _divider(self, parent):
         tk.Frame(parent, bg=BORD, height=1).pack(fill=tk.X, padx=12, pady=(8, 0))
 
+    def _group_header(self, parent, title):
+        f = tk.Frame(parent, bg=INSET, pady=8)
+        f.pack(fill=tk.X, pady=(12, 2))
+        tk.Label(f, text=title, bg=INSET, fg=CYANL,
+                 font=('Helvetica', 10, 'bold')).pack(padx=12, anchor='w')
+
     def _flat_btn(self, parent, text, cmd, bg, fg, abg=None, state=tk.NORMAL):
         return tk.Button(parent, text=text, command=cmd,
                          bg=bg, fg=fg, activebackground=abg or bg,
@@ -172,14 +187,6 @@ class EyeTrackingApp:
         lbl.pack(side=tk.RIGHT)
         return lbl
 
-    def _reset_button(self, parent, cmd):
-        f = tk.Frame(parent, bg=PANEL)
-        f.pack(pady=(2, 6))
-        tk.Button(f, text="⊕  Reset to center", command=cmd,
-                  bg=CARD, fg=TEXT2, relief='flat', cursor='hand2',
-                  activebackground=INSET, activeforeground=CYANL,
-                  font=('Helvetica', 10), padx=10, pady=4).pack()
-
     # ── Build UI ───────────────────────────────────
 
     def _build_ui(self):
@@ -188,23 +195,8 @@ class EyeTrackingApp:
         sidebar.pack(side=tk.LEFT, fill=tk.Y)
         sidebar.pack_propagate(False)
 
-        canvas = tk.Canvas(sidebar, bg=PANEL, highlightthickness=0)
-        sb = tk.Scrollbar(sidebar, orient=tk.VERTICAL, command=canvas.yview,
-                          bg=PANEL, troughcolor=PANEL, bd=0, width=6)
-        canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        inner = tk.Frame(canvas, bg=PANEL)
-        win = canvas.create_window((0, 0), window=inner, anchor='nw')
-        inner.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda e: canvas.itemconfig(win, width=e.width))
-        canvas.bind_all('<Button-4>', lambda _: canvas.yview_scroll(-1, 'units'))
-        canvas.bind_all('<Button-5>', lambda _: canvas.yview_scroll( 1, 'units'))
-        canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(-1*(e.delta//120), 'units'))
-
-        # ── Header ─────────────────────────────────
-        hdr = tk.Frame(inner, bg=CYAND, pady=0)
+        # ── Header (fixed) ─────────────────────────
+        hdr = tk.Frame(sidebar, bg=CYAND, pady=0)
         hdr.pack(fill=tk.X)
         tk.Frame(hdr, bg=CYAN, height=3).pack(fill=tk.X)
         body = tk.Frame(hdr, bg=CYAND, pady=12)
@@ -214,9 +206,9 @@ class EyeTrackingApp:
         tk.Label(body, text="Beam Control System", bg=CYAND, fg=CYANL,
                  font=('Helvetica', 8)).pack()
 
-        # ── Status ─────────────────────────────────
-        self._section_header(inner, "SYSTEM STATUS")
-        st = tk.Frame(inner, bg=PANEL)
+        # ── Status (fixed, always visible above the scroll area) ──
+        self._section_header(sidebar, "SYSTEM STATUS")
+        st = tk.Frame(sidebar, bg=PANEL)
         st.pack(fill=tk.X, padx=14)
 
         f1 = tk.Frame(st, bg=PANEL)
@@ -243,7 +235,9 @@ class EyeTrackingApp:
         lbl2.pack(side=tk.RIGHT)
         self._cam_led = (c2, ov2, lbl2)
 
-        # Precision indicator
+        # Precision indicator — primary (color) reading, with the grayscale
+        # cross-check value shown right below each, smaller/muted, purely
+        # for comparison (never drives threshold/trigger/Arduino).
         tk.Frame(st, bg=BORD, height=1).pack(fill=tk.X, pady=(8, 4))
         prow1 = tk.Frame(st, bg=PANEL)
         prow1.pack(fill=tk.X, pady=1)
@@ -252,17 +246,31 @@ class EyeTrackingApp:
         self._iris_px_lbl = tk.Label(prow1, text="— px", bg=PANEL, fg=MUTED,
                                       font=('Courier', 9, 'bold'))
         self._iris_px_lbl.pack(side=tk.RIGHT)
+        prow1g = tk.Frame(st, bg=PANEL)
+        prow1g.pack(fill=tk.X)
+        tk.Label(prow1g, text="  ↳ B/W", bg=PANEL, fg=MUTED,
+                 font=('Helvetica', 7), width=10, anchor='w').pack(side=tk.LEFT)
+        self._iris_px_gray_lbl = tk.Label(prow1g, text="— px", bg=PANEL, fg=MUTED,
+                                           font=('Courier', 7))
+        self._iris_px_gray_lbl.pack(side=tk.RIGHT)
 
         prow2 = tk.Frame(st, bg=PANEL)
-        prow2.pack(fill=tk.X, pady=1)
+        prow2.pack(fill=tk.X, pady=(4, 1))
         tk.Label(prow2, text="Precision", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
         self._precision_lbl = tk.Label(prow2, text="— mm/px", bg=PANEL, fg=MUTED,
                                         font=('Courier', 9, 'bold'))
         self._precision_lbl.pack(side=tk.RIGHT)
+        prow2g = tk.Frame(st, bg=PANEL)
+        prow2g.pack(fill=tk.X)
+        tk.Label(prow2g, text="  ↳ B/W", bg=PANEL, fg=MUTED,
+                 font=('Helvetica', 7), width=10, anchor='w').pack(side=tk.LEFT)
+        self._precision_gray_lbl = tk.Label(prow2g, text="— mm/px", bg=PANEL, fg=MUTED,
+                                             font=('Courier', 7))
+        self._precision_gray_lbl.pack(side=tk.RIGHT)
 
         prow3 = tk.Frame(st, bg=PANEL)
-        prow3.pack(fill=tk.X, pady=1)
+        prow3.pack(fill=tk.X, pady=(4, 1))
         tk.Label(prow3, text="2 mm =", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
         self._px2mm_lbl = tk.Label(prow3, text="— px", bg=PANEL, fg=MUTED,
@@ -278,8 +286,37 @@ class EyeTrackingApp:
         self._dev_lbl = tk.Label(drow, text="— mm", bg=PANEL, fg=MUTED,
                                   font=('Courier', 10, 'bold'))
         self._dev_lbl.pack(side=tk.RIGHT)
+        drowg = tk.Frame(st, bg=PANEL)
+        drowg.pack(fill=tk.X)
+        tk.Label(drowg, text="  ↳ B/W", bg=PANEL, fg=MUTED,
+                 font=('Helvetica', 7), width=10, anchor='w').pack(side=tk.LEFT)
+        self._dev_gray_lbl = tk.Label(drowg, text="— mm", bg=PANEL, fg=MUTED,
+                                       font=('Courier', 8))
+        self._dev_gray_lbl.pack(side=tk.RIGHT)
 
-        self._divider(inner)
+        self._divider(sidebar)
+
+        # ── Scrollable body (Setting / Flow / Debug) ────
+        scroll_area = tk.Frame(sidebar, bg=PANEL)
+        scroll_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(scroll_area, bg=PANEL, highlightthickness=0)
+        sb = tk.Scrollbar(scroll_area, orient=tk.VERTICAL, command=canvas.yview,
+                          bg=PANEL, troughcolor=PANEL, bd=0, width=6)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = tk.Frame(canvas, bg=PANEL)
+        win = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(win, width=e.width))
+        canvas.bind_all('<Button-4>', lambda _: canvas.yview_scroll(-1, 'units'))
+        canvas.bind_all('<Button-5>', lambda _: canvas.yview_scroll( 1, 'units'))
+        canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(-1*(e.delta//120), 'units'))
+
+        # ── SETTING ──────────────────────────────────
+        self._group_header(inner, "SETTING")
 
         # ── Source ─────────────────────────────────
         self._section_header(inner, "INPUT SOURCE")
@@ -394,17 +431,34 @@ class EyeTrackingApp:
 
         self._divider(inner)
 
-        # ── Target position ────────────────────────
-        self._section_header(inner, "TARGET POSITION")
-        self.pos_lbl = tk.Label(inner, text="X: 320   Y: 240",
-                                 bg=PANEL, fg=CYANL, font=('Courier', 10, 'bold'))
-        self.pos_lbl.pack(pady=(2, 4))
-        self._reset_button(inner, self._pan_reset)
+        # ── DEBUG ────────────────────────────────────
+        self._group_header(inner, "DEBUG")
+        self._debug_active = False
+        self._debug_btn = self._flat_btn(
+            inner, "⬤  START DEBUG", self._on_debug_toggle,
+            PANEL, TEXT2, INSET, state=tk.DISABLED)
+        self._debug_btn.pack(fill=tk.X, padx=12, pady=(0, 4))
+        self._debug_lbl = tk.Label(inner, text="", bg=PANEL, fg=MUTED,
+                                    font=('Courier', 8))
+        self._debug_lbl.pack(pady=(0, 10))
 
-        self._divider(inner)
+        # ── Right sidebar: FLOW (pinned, no scroll) ─
+        right = tk.Frame(self.root, bg=PANEL, width=240)
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+        right.pack_propagate(False)
+
+        self._group_header(right, "FLOW")
+
+        # ── Target position ────────────────────────
+        self._section_header(right, "TARGET POSITION")
+        self.pos_lbl = tk.Label(right, text="X: 320   Y: 240",
+                                 bg=PANEL, fg=CYANL, font=('Courier', 10, 'bold'))
+        self.pos_lbl.pack(pady=(2, 8))
+
+        self._divider(right)
 
         # ── Beam status ────────────────────────────
-        beam_outer = tk.Frame(inner, bg=BORD, padx=1, pady=1)
+        beam_outer = tk.Frame(right, bg=BORD, padx=1, pady=1)
         beam_outer.pack(fill=tk.X, padx=12, pady=10)
         self._beam_frame = tk.Frame(beam_outer, bg=CARD, pady=14)
         self._beam_frame.pack(fill=tk.X)
@@ -424,12 +478,17 @@ class EyeTrackingApp:
         self._beam_sub.pack(pady=(4, 0))
 
         # ── Controls ───────────────────────────────
-        ctrl = tk.Frame(inner, bg=PANEL)
+        ctrl = tk.Frame(right, bg=PANEL)
         ctrl.pack(fill=tk.X, padx=12, pady=(4, 2))
 
+        self.ready_btn = self._flat_btn(ctrl, "○   READY",
+                                         self._toggle_ready, PANEL, TEXT2, INSET)
+        self.ready_btn.pack(fill=tk.X, pady=(0, 3))
+        tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
+
         self.start_btn = self._flat_btn(ctrl, "▶   START TRACKING",
-                                         self.start, CYAN, CYAND, CYAND)
-        self.start_btn.pack(fill=tk.X, pady=(0, 3))
+                                         self.start, MUTED, PANEL, MUTED)
+        self.start_btn.pack(fill=tk.X, pady=(3, 3))
 
         self.stop_btn = self._flat_btn(ctrl, "■   STOP",
                                         self.stop, CARD, TEXT2, INSET,
@@ -443,33 +502,21 @@ class EyeTrackingApp:
                                          INSET, state=tk.DISABLED)
         self.pause_btn.pack(fill=tk.X)
 
-        self._divider(inner)
+        self._divider(right)
 
         # ── Record ─────────────────────────────────
-        self._section_header(inner, "RECORDING  (camera only)")
-        self.rec_timer_lbl = tk.Label(inner, text="", bg=PANEL, fg=REDL,
+        self._section_header(right, "RECORDING  (camera only)")
+        self.rec_timer_lbl = tk.Label(right, text="", bg=PANEL, fg=REDL,
                                        font=('Courier', 9, 'bold'))
         self.rec_timer_lbl.pack(pady=(2, 2))
-        self.rec_btn = self._flat_btn(inner, "⏺   RECORD",
+        self.rec_btn = self._flat_btn(right, "⏺   RECORD",
                                        self._toggle_rec, PANEL, MUTED, INSET,
                                        state=tk.DISABLED)
         self.rec_btn.pack(fill=tk.X, padx=12, pady=(0, 8))
 
-        # ── Debug ──────────────────────────────────
-        self._divider(inner)
-        self._section_header(inner, "DEBUG")
-        self._debug_active = False
-        self._debug_btn = self._flat_btn(
-            inner, "⬤  START DEBUG", self._on_debug_toggle,
-            PANEL, TEXT2, INSET, state=tk.DISABLED)
-        self._debug_btn.pack(fill=tk.X, padx=12, pady=(0, 4))
-        self._debug_lbl = tk.Label(inner, text="", bg=PANEL, fg=MUTED,
-                                    font=('Courier', 8))
-        self._debug_lbl.pack(pady=(0, 10))
-
         # ── Camera feed ────────────────────────────
         feed = tk.Frame(self.root, bg='#060E16')
-        feed.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        feed.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.camera_label = tk.Label(feed, bg='#060E16', cursor='crosshair')
         self.camera_label.pack(fill=tk.BOTH, expand=True)
         self.camera_label.bind('<Button-1>', self._on_feed_click)
@@ -479,17 +526,22 @@ class EyeTrackingApp:
     def _set_source(self, value):
         if self.input_mode.get() == value:
             return
-        was_running = self.capture is not None and self.capture.running
-        if was_running:
-            self.stop()
+        if self.capture is not None and self.capture.running:
+            self.arduino.send(b'B0\n')
+            self._beam_off()
+            self._teardown_capture()
+            if self.ready:
+                self.start_btn.config(state=tk.NORMAL, bg=CYAN, fg=CYAND,
+                                      activebackground=CYAND, activeforeground=CYAND)
+            else:
+                self.start_btn.config(state=tk.NORMAL, bg=MUTED, fg=PANEL)
+            self.stop_btn.config(state=tk.DISABLED, bg=CARD, fg=TEXT2,
+                                 activebackground=INSET, activeforeground=TEXT2)
         self.input_mode.set(value)
         self._update_tabs()
         self._toggle_video_panel()
-        if was_running:
-            if value == 'camera':
-                self.start()
-            elif self.video_path.get().strip():
-                self.start()
+        if value == 'camera':
+            self._open_capture(armed=False)
 
     def _update_tabs(self):
         cam = self.input_mode.get() == 'camera'
@@ -516,13 +568,7 @@ class EyeTrackingApp:
         if path:
             self.video_path.set(path)
 
-    # ── Zoom / Pan ─────────────────────────────────
-
-    def _pan_reset(self):
-        x, y = self._frame_w // 2, self._frame_h // 2
-        self.center_x.set(x)
-        self.center_y.set(y)
-        self.pos_lbl.config(text=f"X: {x:4d}   Y: {y:4d}")
+    # ── Feed click ─────────────────────────────────
 
     def _on_feed_click(self, event):
         lw = self.camera_label.winfo_width()
@@ -531,10 +577,30 @@ class EyeTrackingApp:
         disp_h = int(self._frame_h * self._display_scale)
         ox = (lw - disp_w) // 2
         oy = (lh - disp_h) // 2
+        # Position within whatever frame is currently on screen — the wide
+        # frame normally, or whichever view is main (CaptureThread swaps what
+        # it sends; dimensions always stay frame_w x frame_h).
         fx = int((event.x - ox) / self._display_scale)
         fy = int((event.y - oy) / self._display_scale)
         fx = max(0, min(self._frame_w, fx))
         fy = max(0, min(self._frame_h, fy))
+
+        vm = self._last_view_meta
+        if vm:
+            for inset in vm.get('insets', ()):
+                ix1, iy1, ix2, iy2 = inset['rect']
+                if ix1 <= fx <= ix2 and iy1 <= fy <= iy2:
+                    # clicked a small inset — promote it to the main view,
+                    # don't touch the target
+                    self._p['main_view'] = inset['view']
+                    return
+            if vm.get('crop'):
+                # clicked the big zoomed view — map back to the real frame position
+                cx1, cy1, cx2, cy2 = vm['crop']
+                scale = vm['scale']
+                fx = int(max(0, min(self._frame_w, cx1 + fx / scale)))
+                fy = int(max(0, min(self._frame_h, cy1 + fy / scale)))
+
         self.center_x.set(fx)
         self.center_y.set(fy)
         self.pos_lbl.config(text=f"X: {fx:4d}   Y: {fy:4d}")
@@ -692,6 +758,30 @@ class EyeTrackingApp:
             color = REDL
         self._dev_lbl.config(text=f"{deviation_mm:.2f} mm", fg=color)
 
+    # ── Grayscale cross-check readouts (comparison only) ───────
+
+    def _update_precision_gray(self, iris_px):
+        if iris_px is None or iris_px <= 0:
+            self._iris_px_gray_lbl.config(text="— px")
+            self._precision_gray_lbl.config(text="— mm/px")
+            return
+        mm_per_px = config.IRIS_MM / iris_px
+        self._iris_px_gray_lbl.config(text=f"{iris_px} px")
+        self._precision_gray_lbl.config(text=f"{mm_per_px:.2f} mm/px")
+
+    def _update_deviation_gray(self, deviation_mm):
+        if deviation_mm is None:
+            self._dev_gray_lbl.config(text="— mm", fg=MUTED)
+            return
+        thr = self._p.get('threshold_mm', 3.0)
+        if deviation_mm <= thr * 0.5:
+            color = GREENL
+        elif deviation_mm <= thr:
+            color = AMBERL
+        else:
+            color = REDL
+        self._dev_gray_lbl.config(text=f"{deviation_mm:.2f} mm", fg=color)
+
     # ── Beam indicator ─────────────────────────────
 
     def _beam_on(self):
@@ -708,26 +798,110 @@ class EyeTrackingApp:
         self.beam_lbl.config(text="BEAM OFF", bg=CARD, fg=MUTED)
         self._beam_sub.config(text="Shutter: Closed", bg=CARD, fg=MUTED)
 
-    # ── Start / Stop ───────────────────────────────
+    # ── Ready check ─────────────────────────────────
+    # Local precondition gate only (Arduino + camera connected). This does not
+    # touch the TSS interlock in any way — eye_tracking runs standalone with
+    # no FPGA on the connector, so real Enable/authorization is a physical
+    # precondition outside this software, not something this button grants.
 
-    def start(self):
+    def _toggle_ready(self):
+        if not self.ready:
+            if not self.arduino.is_connected:
+                messagebox.showwarning(
+                    "Not connected", "Arduino ยังไม่เชื่อมต่อ กรุณาต่อ Arduino ก่อน")
+                return
+            if not self._cam_ok:
+                messagebox.showwarning(
+                    "Not connected", "กล้องยังไม่พร้อม กรุณาตรวจสอบกล้องก่อน")
+                return
+            self.ready = True
+            self.ready_btn.config(text="●   UNREADY", bg=GREENB, fg=GREENL,
+                                  activebackground=GREENB, activeforeground=GREENL)
+            self.start_btn.config(bg=CYAN, fg=CYAND,
+                                  activebackground=CYAND, activeforeground=CYAND)
+        else:
+            if self.capture and self.capture.running and self.capture.armed:
+                choice = self._confirm_disable_dialog()
+                if choice == 'cancel':
+                    return
+                if choice == 'kill':
+                    self.arduino.send(b'B0\n')
+                self.stop()
+            self.ready = False
+            self.ready_btn.config(text="○   READY", bg=PANEL, fg=TEXT2,
+                                  activebackground=INSET, activeforeground=TEXT)
+            self.start_btn.config(bg=MUTED, fg=PANEL)
+
+    def _confirm_disable_dialog(self):
+        result = {'choice': 'cancel'}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Beam check")
+        dlg.configure(bg=PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        tk.Label(dlg, text="Beam status before disabling?",
+                 bg=PANEL, fg=TEXT, font=('Helvetica', 10, 'bold'),
+                 padx=20, pady=14).pack()
+        tk.Label(dlg, text="Press \"Kill beam\" if the beam may still be active.\n"
+                            "Press \"Continue\" if the beam has ended.",
+                 bg=PANEL, fg=TEXT2, font=('Helvetica', 9), padx=20,
+                 justify='left').pack(pady=(0, 10))
+        btnf = tk.Frame(dlg, bg=PANEL)
+        btnf.pack(pady=(0, 14), padx=14)
+
+        def pick(c):
+            result['choice'] = c
+            dlg.destroy()
+
+        tk.Button(btnf, text="Kill beam", command=lambda: pick('kill'),
+                  bg=REDB, fg=REDL, relief='flat', padx=12, pady=6,
+                  font=('Helvetica', 9, 'bold')).pack(side=tk.LEFT, padx=4)
+        tk.Button(btnf, text="Continue", command=lambda: pick('continue'),
+                  bg=GREENB, fg=GREENL, relief='flat', padx=12, pady=6,
+                  font=('Helvetica', 9, 'bold')).pack(side=tk.LEFT, padx=4)
+        tk.Button(btnf, text="Cancel", command=lambda: pick('cancel'),
+                  bg=AMBERB, fg=AMBERL, relief='flat', padx=12, pady=6,
+                  font=('Helvetica', 9, 'bold')).pack(side=tk.LEFT, padx=4)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: pick('cancel'))
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width()  // 2 - dlg.winfo_width()  // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2 - dlg.winfo_height() // 2)
+        dlg.geometry(f"+{x}+{y}")
+        dlg.wait_window()
+        return result['choice']
+
+    # ── Start / Stop ───────────────────────────────
+    # Camera preview (unarmed) and beam tracking (armed) share the same
+    # CaptureThread loop — arming only gates whether it may ever send B1 to
+    # the Arduino (see CaptureThread.armed). This lets Eye Selection,
+    # Threshold, and Target Position all be set against a live picture
+    # before READY/START are touched, without the beam ever being reachable.
+
+    def _open_capture(self, armed):
+        """Open the camera/video and start CaptureThread. armed=False is a
+        preview-only session (beam relay stays gated off); armed=True is a
+        real tracking run and requires the caller to have checked READY."""
         is_video = self.input_mode.get() == 'video'
 
         if is_video:
             path = self.video_path.get().strip()
             if not path:
-                messagebox.showerror("No File", "Please select a video file first.")
+                if armed:
+                    messagebox.showerror("No File", "Please select a video file first.")
                 return
             self.cap = cv2.VideoCapture(path)
             if not self.cap.isOpened():
-                messagebox.showerror("Error", f"Cannot open video:\n{path}")
+                if armed:
+                    messagebox.showerror("Error", f"Cannot open video:\n{path}")
                 self._led_set(self._cam_led, False)
                 return
         else:
             self.cap = cv2.VideoCapture(0)
             if not self.cap.isOpened():
                 self._led_set(self._cam_led, False)
+                self._cam_ok = False
                 return
+            self._cam_ok = True
 
         self._video_fps          = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self._video_total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -742,12 +916,14 @@ class EyeTrackingApp:
             frame_queue=self.frame_queue, pause_event=self.pause_event,
             on_video_end=lambda: self.root.after(0, self.stop),
             on_progress=self._on_progress,
+            armed=armed,
         )
         self.capture.start()
 
-        self.start_btn.config(state=tk.DISABLED, bg=MUTED, fg=PANEL)
-        self.stop_btn.config(state=tk.NORMAL, bg=REDB, fg=REDL,
-                             activebackground=REDB, activeforeground=REDL)
+        if armed:
+            self.start_btn.config(state=tk.DISABLED, bg=MUTED, fg=PANEL)
+            self.stop_btn.config(state=tk.NORMAL, bg=REDB, fg=REDL,
+                                 activebackground=REDB, activeforeground=REDL)
         self._debug_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
                                activebackground=INSET, activeforeground=TEXT)
 
@@ -768,7 +944,8 @@ class EyeTrackingApp:
 
         self._update_frame()
 
-    def stop(self):
+    def _teardown_capture(self):
+        """Fully close the capture thread and camera/video device."""
         if self.capture:
             self.capture.stop_recording()
             self.capture.stop()
@@ -776,13 +953,16 @@ class EyeTrackingApp:
         if self.cap:
             self.cap.release()
             self.cap = None
-
-        self.arduino.send(b'B0\n')
-        self._beam_off()
-
-        self.start_btn.config(state=tk.NORMAL, bg=CYAN, fg=CYAND)
-        self.stop_btn.config(state=tk.DISABLED, bg=CARD, fg=TEXT2,
-                             activebackground=INSET, activeforeground=TEXT2)
+        self.camera_label.config(image='', bg='#060E16')
+        self._led_set(self._cam_led, False)
+        self._update_precision(None)
+        self._update_deviation(None)
+        self._update_precision_gray(None)
+        self._update_deviation_gray(None)
+        self.video_progress.set(0)
+        self.prog_lbl.config(text="--:-- / --:--")
+        self._p['main_view'] = 'wide'
+        self._last_view_meta = None
         self.pause_btn.config(text="⏸   PAUSE", state=tk.DISABLED,
                               bg=PANEL, fg=MUTED)
         self.prog_slider.config(state=tk.DISABLED)
@@ -794,12 +974,47 @@ class EyeTrackingApp:
         self._debug_btn.config(text="⬤  START DEBUG", state=tk.DISABLED,
                                bg=PANEL, fg=MUTED)
         self._debug_lbl.config(text="")
-        self.camera_label.config(image='', bg='#060E16')
-        self._led_set(self._cam_led, False)
-        self._update_precision(None)
-        self._update_deviation(None)
-        self.video_progress.set(0)
-        self.prog_lbl.config(text="--:-- / --:--")
+
+    def start(self):
+        if not self.ready:
+            messagebox.showerror("Not ready", "กรุณากด READY ก่อนเริ่ม tracking")
+            return
+        if self.capture and self.capture.running:
+            # preview is already live (camera mode) — just arm the beam relay
+            self.capture.armed = True
+            self.start_btn.config(state=tk.DISABLED, bg=MUTED, fg=PANEL)
+            self.stop_btn.config(state=tk.NORMAL, bg=REDB, fg=REDL,
+                                 activebackground=REDB, activeforeground=REDL)
+            return
+        self._open_capture(armed=True)
+
+    def stop(self):
+        """Disarm the beam relay. In camera mode the preview keeps running
+        (so the picture never goes blank between runs); video playback fully
+        stops, matching the old behaviour."""
+        self.arduino.send(b'B0\n')
+        self._beam_off()
+        if self.capture:
+            self.capture.armed = False
+
+        if self.input_mode.get() == 'video':
+            self._teardown_capture()
+        elif self.capture and self.capture._recording:
+            # preview keeps running, but a run that was being recorded should
+            # still end its recording when disarmed — matches the old
+            # behaviour where STOP always closed out any active recording.
+            self.capture.stop_recording()
+            self.rec_btn.config(text="⏺   RECORD", bg=PANEL, fg=TEXT2,
+                                activebackground=INSET, activeforeground=TEXT)
+            self.rec_timer_lbl.config(text="")
+
+        if self.ready:
+            self.start_btn.config(state=tk.NORMAL, bg=CYAN, fg=CYAND,
+                                  activebackground=CYAND, activeforeground=CYAND)
+        else:
+            self.start_btn.config(state=tk.NORMAL, bg=MUTED, fg=PANEL)
+        self.stop_btn.config(state=tk.DISABLED, bg=CARD, fg=TEXT2,
+                             activebackground=INSET, activeforeground=TEXT2)
 
     # ── Frame display ──────────────────────────────
 
@@ -814,6 +1029,9 @@ class EyeTrackingApp:
                 self._beam_off()
             self._update_precision(metrics.get('iris_px'))
             self._update_deviation(metrics.get('deviation_mm'))
+            self._update_precision_gray(metrics.get('iris_px_gray'))
+            self._update_deviation_gray(metrics.get('deviation_mm_gray'))
+            self._last_view_meta = metrics.get('view_meta')
             self._frame_h, self._frame_w = frame.shape[:2]
             w = max(self.camera_label.winfo_width(),  640)
             h = max(self.camera_label.winfo_height(), 480)
@@ -834,6 +1052,9 @@ class EyeTrackingApp:
     # ── Close ──────────────────────────────────────
 
     def on_close(self):
-        self.stop()
+        self.arduino.send(b'B0\n')
+        if self.capture:
+            self.capture.armed = False
+        self._teardown_capture()
         self.arduino.close()
         self.root.destroy()

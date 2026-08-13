@@ -1,6 +1,7 @@
 import cv2
 import os
 import queue
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -19,10 +20,17 @@ import config
 
 
 class EyeTrackingApp:
-    def __init__(self, root):
+    def __init__(self, root, debug=False):
         self.root = root
         self.root.title("Eye Tracking Beam Control")
         self.root.configure(bg=BG)
+
+        # Debug mode (EYE_TRACKING_DEBUG=1) exposes dev/test-only affordances
+        # that have no place in a real treatment session: the Video input
+        # source (replays an arbitrary recorded clip through the same
+        # detection pipeline as Camera) and the DEBUG frame-dump recorder.
+        # Camera is the only input source a clinical operator ever sees.
+        self.debug = debug
 
         self.cap = None
         self.capture: CaptureThread | None = None
@@ -50,6 +58,7 @@ class EyeTrackingApp:
         self._seeking            = False
         self._rec_start_time     = 0.0
         self._rec_path           = ''
+        self.last_recording_path = ''
 
         self._display_scale = 1.0
         self._display_ox    = 0
@@ -319,25 +328,34 @@ class EyeTrackingApp:
         self._group_header(inner, "SETTING")
 
         # ── Source ─────────────────────────────────
-        self._section_header(inner, "INPUT SOURCE")
-        tabs = tk.Frame(inner, bg=INSET, padx=2, pady=2)
-        tabs.pack(fill=tk.X, padx=12, pady=(0, 4))
-        tabs.columnconfigure(0, weight=1)
-        tabs.columnconfigure(1, weight=1)
-        self._cam_tab = tk.Button(tabs, text="Camera",
-                                   command=lambda: self._set_source('camera'),
-                                   relief='flat', cursor='hand2', pady=7, bd=0,
-                                   font=('Helvetica', 9, 'bold'))
-        self._cam_tab.grid(row=0, column=0, sticky='ew', padx=(0, 1))
-        self._vid_tab = tk.Button(tabs, text="Video",
-                                   command=lambda: self._set_source('video'),
-                                   relief='flat', cursor='hand2', pady=7, bd=0,
-                                   font=('Helvetica', 9, 'bold'))
-        self._vid_tab.grid(row=0, column=1, sticky='ew', padx=(1, 0))
-        self._tab_row = tabs
-        self._update_tabs()
+        # Camera is the only input source a clinical operator ever sees or
+        # needs — input_mode stays 'camera' for the life of the app unless
+        # debug mode is on. The Video tab (replay a recorded clip through
+        # the same pipeline) is a dev/regression-test tool only; there is no
+        # real scenario for firing the beam from a pre-recorded file. See
+        # the "Input Source — Camera vs Video" note in the 12.1 writeup.
+        if self.debug:
+            self._section_header(inner, "INPUT SOURCE")
+            tabs = tk.Frame(inner, bg=INSET, padx=2, pady=2)
+            tabs.pack(fill=tk.X, padx=12, pady=(0, 4))
+            tabs.columnconfigure(0, weight=1)
+            tabs.columnconfigure(1, weight=1)
+            self._cam_tab = tk.Button(tabs, text="Camera",
+                                       command=lambda: self._set_source('camera'),
+                                       relief='flat', cursor='hand2', pady=7, bd=0,
+                                       font=('Helvetica', 9, 'bold'))
+            self._cam_tab.grid(row=0, column=0, sticky='ew', padx=(0, 1))
+            self._vid_tab = tk.Button(tabs, text="Video",
+                                       command=lambda: self._set_source('video'),
+                                       relief='flat', cursor='hand2', pady=7, bd=0,
+                                       font=('Helvetica', 9, 'bold'))
+            self._vid_tab.grid(row=0, column=1, sticky='ew', padx=(1, 0))
+            self._tab_row = tabs
+            self._update_tabs()
 
-        # Video panel
+        # Video panel (built even outside debug mode: harmless while unused —
+        # it only ever becomes visible via _toggle_video_panel(), which is
+        # only ever reached from the Video tab click handler above)
         self.video_panel = tk.Frame(inner, bg=CARD)
         tk.Label(self.video_panel, text="FILE PATH", bg=CARD, fg=TEXT2,
                  font=('Helvetica', 7, 'bold')).pack(anchor='w', padx=12, pady=(8, 2))
@@ -386,11 +404,14 @@ class EyeTrackingApp:
         self._section_header(inner, "EYE SELECTION")
         er = tk.Frame(inner, bg=PANEL)
         er.pack(fill=tk.X, padx=12, pady=(0, 4))
+        self._eye_radios = []
         for txt, val in (("Left Eye", "left"), ("Right Eye", "right")):
-            tk.Radiobutton(er, text=txt, variable=self.eye_side, value=val,
-                           bg=PANEL, fg=TEXT2, selectcolor=INSET,
-                           activebackground=PANEL, activeforeground=CYANL,
-                           font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(0, 16))
+            rb = tk.Radiobutton(er, text=txt, variable=self.eye_side, value=val,
+                                 bg=PANEL, fg=TEXT2, selectcolor=INSET,
+                                 activebackground=PANEL, activeforeground=CYANL,
+                                 font=('Helvetica', 9))
+            rb.pack(side=tk.LEFT, padx=(0, 16))
+            self._eye_radios.append(rb)
 
         self._divider(inner)
 
@@ -422,25 +443,31 @@ class EyeTrackingApp:
         self._thr_lbl = tk.Label(trow, text="3.0 mm", bg=PANEL, fg=AMBERL,
                                   font=('Courier', 10, 'bold'))
         self._thr_lbl.pack(side=tk.RIGHT)
-        tk.Scale(inner, from_=0.5, to=10.0, resolution=0.5,
-                 orient=tk.HORIZONTAL, variable=self.threshold_mm,
-                 bg=PANEL, troughcolor=INSET, highlightthickness=0,
-                 showvalue=False, fg=TEXT,
-                 command=lambda v: self._thr_lbl.config(text=f"{float(v):.1f} mm")
-                 ).pack(fill=tk.X, padx=12, pady=(0, 6))
+        self._threshold_scale = tk.Scale(
+            inner, from_=0.5, to=10.0, resolution=0.5,
+            orient=tk.HORIZONTAL, variable=self.threshold_mm,
+            bg=PANEL, troughcolor=INSET, highlightthickness=0,
+            showvalue=False, fg=TEXT,
+            command=lambda v: self._thr_lbl.config(text=f"{float(v):.1f} mm"))
+        self._threshold_scale.pack(fill=tk.X, padx=12, pady=(0, 6))
 
         self._divider(inner)
 
         # ── DEBUG ────────────────────────────────────
-        self._group_header(inner, "DEBUG")
+        # Dumps eye-crop frames + a log.csv for offline algorithm tuning —
+        # a development tool, not something a clinical operator needs. The
+        # widgets are always created (capture start/stop touches them
+        # unconditionally below) but only shown when debug mode is on.
         self._debug_active = False
         self._debug_btn = self._flat_btn(
             inner, "⬤  START DEBUG", self._on_debug_toggle,
             PANEL, TEXT2, INSET, state=tk.DISABLED)
-        self._debug_btn.pack(fill=tk.X, padx=12, pady=(0, 4))
         self._debug_lbl = tk.Label(inner, text="", bg=PANEL, fg=MUTED,
                                     font=('Courier', 8))
-        self._debug_lbl.pack(pady=(0, 10))
+        if self.debug:
+            self._group_header(inner, "DEBUG")
+            self._debug_btn.pack(fill=tk.X, padx=12, pady=(0, 4))
+            self._debug_lbl.pack(pady=(0, 10))
 
         # ── Right sidebar: FLOW (pinned, no scroll) ─
         right = tk.Frame(self.root, bg=PANEL, width=240)
@@ -512,7 +539,11 @@ class EyeTrackingApp:
         self.rec_btn = self._flat_btn(right, "⏺   RECORD",
                                        self._toggle_rec, PANEL, MUTED, INSET,
                                        state=tk.DISABLED)
-        self.rec_btn.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self.rec_btn.pack(fill=tk.X, padx=12, pady=(0, 3))
+        self.review_btn = self._flat_btn(right, "▶   REVIEW",
+                                          self._review_last_recording,
+                                          PANEL, MUTED, INSET, state=tk.DISABLED)
+        self.review_btn.pack(fill=tk.X, padx=12, pady=(0, 8))
 
         # ── Camera feed ────────────────────────────
         feed = tk.Frame(self.root, bg='#060E16')
@@ -601,6 +632,8 @@ class EyeTrackingApp:
                 fx = int(max(0, min(self._frame_w, cx1 + fx / scale)))
                 fy = int(max(0, min(self._frame_h, cy1 + fy / scale)))
 
+        if self.capture and self.capture.armed:
+            return
         self.center_x.set(fx)
         self.center_y.set(fy)
         self.pos_lbl.config(text=f"X: {fx:4d}   Y: {fy:4d}")
@@ -657,6 +690,7 @@ class EyeTrackingApp:
         self._rec_start_time = time.time()
         self.rec_btn.config(text="⏹   STOP REC", bg=REDB, fg=REDL,
                             activebackground=REDB, activeforeground=REDL)
+        self.review_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTED)
         self._tick_rec()
 
     def _stop_rec(self):
@@ -666,9 +700,25 @@ class EyeTrackingApp:
                             activebackground=INSET, activeforeground=TEXT2)
         self.rec_timer_lbl.config(text="")
         if self._rec_path:
+            self.last_recording_path = self._rec_path
             self.video_path.set(self._rec_path)
             self._rec_path = ''
-            messagebox.showinfo("Saved", "Recording saved.\nPath auto-filled in Video mode.")
+            self.review_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
+                                   activebackground=INSET, activeforeground=TEXT)
+            messagebox.showinfo("Saved", "Recording saved.\nกด REVIEW เพื่อเปิดดูซ้ำได้ทันที")
+
+    def _review_last_recording(self):
+        """Open the last recording in the OS default video player. Deliberately
+        not routed through the in-app Video tab/pipeline — that stays a
+        debug-only tool, this is just a quick look at what was captured."""
+        if not self.last_recording_path:
+            return
+        try:
+            subprocess.Popen(['xdg-open', self.last_recording_path])
+        except FileNotFoundError:
+            messagebox.showerror(
+                "Review",
+                f"ไม่พบโปรแกรมเปิดวิดีโอ (xdg-open)\nไฟล์อยู่ที่:\n{self.last_recording_path}")
 
     def _tick_rec(self):
         if not self.capture or not self.capture._recording:
@@ -799,10 +849,11 @@ class EyeTrackingApp:
         self._beam_sub.config(text="Shutter: Closed", bg=CARD, fg=MUTED)
 
     # ── Ready check ─────────────────────────────────
-    # Local precondition gate only (Arduino + camera connected). This does not
-    # touch the TSS interlock in any way — eye_tracking runs standalone with
-    # no FPGA on the connector, so real Enable/authorization is a physical
-    # precondition outside this software, not something this button grants.
+    # Precondition gate (Arduino + camera connected) that also drives the DB9
+    # Enable line (relay A) — mirrors KCMH-Tricker's Enable checkbox: a human
+    # must press READY before Enable asserts, and UNREADY drops it again,
+    # instead of Enable being tied permanently high the moment the board has
+    # power.
 
     def _toggle_ready(self):
         if not self.ready:
@@ -815,6 +866,7 @@ class EyeTrackingApp:
                     "Not connected", "กล้องยังไม่พร้อม กรุณาตรวจสอบกล้องก่อน")
                 return
             self.ready = True
+            self.arduino.send(b'E1\n')
             self.ready_btn.config(text="●   UNREADY", bg=GREENB, fg=GREENL,
                                   activebackground=GREENB, activeforeground=GREENL)
             self.start_btn.config(bg=CYAN, fg=CYAND,
@@ -827,6 +879,7 @@ class EyeTrackingApp:
                 if choice == 'kill':
                     self.arduino.send(b'B0\n')
                 self.stop()
+            self.arduino.send(b'E0\n')
             self.ready = False
             self.ready_btn.config(text="○   READY", bg=PANEL, fg=TEXT2,
                                   activebackground=INSET, activeforeground=TEXT)
@@ -975,10 +1028,26 @@ class EyeTrackingApp:
                                bg=PANEL, fg=MUTED)
         self._debug_lbl.config(text="")
 
+    def _set_config_locked(self, locked):
+        """Lock the tracking-config controls (eye side, detection method,
+        threshold; target position is gated separately in _on_feed_click)
+        while armed — a value silently changing mid-session (stray click,
+        bumped slider) would change beam-gating behaviour with no record."""
+        state = tk.DISABLED if locked else tk.NORMAL
+        for rb in self._eye_radios:
+            rb.config(state=state)
+        self._fm_tab.config(state=state)
+        self._fp_tab.config(state=state)
+        self._threshold_scale.config(state=state)
+        if self.debug:
+            self._cam_tab.config(state=state)
+            self._vid_tab.config(state=state)
+
     def start(self):
         if not self.ready:
             messagebox.showerror("Not ready", "กรุณากด READY ก่อนเริ่ม tracking")
             return
+        self._set_config_locked(True)
         if self.capture and self.capture.running:
             # preview is already live (camera mode) — just arm the beam relay
             self.capture.armed = True
@@ -994,6 +1063,7 @@ class EyeTrackingApp:
         stops, matching the old behaviour."""
         self.arduino.send(b'B0\n')
         self._beam_off()
+        self._set_config_locked(False)
         if self.capture:
             self.capture.armed = False
 
@@ -1053,6 +1123,7 @@ class EyeTrackingApp:
 
     def on_close(self):
         self.arduino.send(b'B0\n')
+        self.arduino.send(b'E0\n')
         if self.capture:
             self.capture.armed = False
         self._teardown_capture()

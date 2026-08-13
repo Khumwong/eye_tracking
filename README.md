@@ -9,6 +9,20 @@ source venv/bin/activate
 python main.py
 ```
 
+ค่าเริ่มต้นคือ **โหมดใช้งานจริง**: มีแหล่งภาพเดียวคือ Camera (ไม่มีแท็บให้เลือก) และไม่มีส่วน DEBUG แสดงอยู่ในหน้าจอ
+
+### โหมด debug (สำหรับพัฒนา/ทดสอบเท่านั้น)
+
+```bash
+EYE_TRACKING_DEBUG=1 python main.py
+```
+
+เปิดใช้งานสองอย่างที่ไม่ควรมีตอนใช้งานจริงกับผู้ป่วย:
+- แท็บ **Input Source: Camera / Video** — โหมด Video เล่นไฟล์วิดีโอที่บันทึกไว้ซ้ำผ่าน pipeline เดียวกัน มีไว้สำหรับ regression test/สาธิตเมื่อไม่มีกล้อง ไม่มีสถานการณ์ใช้งานจริงที่ยิงลำโปรตอนจากไฟล์วิดีโอ
+- ส่วน **DEBUG** (START DEBUG) — บันทึกภาพ crop ตาทุก 3 เฟรม + `log.csv` ลง `debug/session_.../` ไว้ให้ทีมพัฒนาไปจูน algorithm
+
+ปุ่ม **REVIEW** ใน FLOW panel (ฝั่งขวา) ไม่เกี่ยวกับ debug mode — เปิดดูไฟล์ recording ล่าสุดด้วยโปรแกรมเล่นวิดีโอเริ่มต้นของเครื่อง (`xdg-open`) ใช้งานได้ทั้งสองโหมดหลังกด RECORD แล้ว STOP REC อย่างน้อยหนึ่งครั้ง
+
 ---
 
 ## โครงสร้างไฟล์
@@ -61,7 +75,7 @@ eye_tracking/
 ### `arduino.py` — `ArduinoController`
 - `connect_async()`: เชื่อมต่อ serial port ใน background thread พร้อม callback เมื่อเสร็จ
 - `send(msg)`: ส่งคำสั่งผ่าน serial พร้อม lock
-- คำสั่งที่ใช้: `B1\n` = เปิด beam, `B0\n` = ปิด beam
+- คำสั่งที่ใช้: `B1\n`/`B0\n` = เปิด/ปิด beam, `E1\n`/`E0\n` = เปิด/ปิด Enable (ส่งตอนกด READY/UNREADY)
 - Arduino ส่ง `READY\n` ตอน boot เพื่อยืนยัน connection (ป้องกัน false positive จาก device อื่น)
 
 ---
@@ -73,8 +87,8 @@ eye_tracking/
 | Board | Arduino Mega 2560 Pro |
 | Serial Port | `/dev/ttyUSB1` (เสียบ USB ช่องเดิมทุกครั้ง) |
 | Baud Rate | 9600 |
-| **Relay Pin (A)** | **Digital Pin 4** — ตั้ง HIGH ค้างไว้ตลอดตั้งแต่ setup() ไม่ถูกสั่งซ้ำอีก |
-| **Relay Pin (B)** | **Digital Pin 6** — ตัวเดียวที่ toggle ตาม B0/B1 |
+| **Relay Pin (A)** | **Digital Pin 4** — Enable, toggle ตาม E0/E1 (เริ่มที่ LOW ตอน boot — fail-safe) |
+| **Relay Pin (B)** | **Digital Pin 6** — Beam, toggle ตาม B0/B1 |
 | Sketch | `arduino_sketch/eye_tracking_beam/eye_tracking_beam.ino` |
 
 ### DB9 wiring (TSS interlock)
@@ -83,10 +97,10 @@ eye_tracking/
 |---|---|---|
 | 1 | Gating Beam ON | Relay B (สลับไป pin 3 ตอน OFF / กลุ่ม pin 4-6 ตอน ON) |
 | 3 | GND | คงที่ |
-| 4 | +12V Ref | Relay A short เข้ากับ pin 6 (ค้างไว้ตลอด ทำหน้าที่เหมือน jumper) |
-| 6 | Enable | ต่อกับ pin 4 ผ่าน Relay A ที่เปิดค้างไว้ตลอด (**ไม่ใช่สายจัมเปอร์จริง** — เป็น "software jumper": Relay A ถูกตั้ง HIGH ครั้งเดียวใน setup() แล้วไม่แตะอีกเลย) |
+| 4 | +12V Ref | Relay A short เข้ากับ pin 6 ตอน Enable ON |
+| 6 | Enable | ต่อกับ pin 4 ผ่าน Relay A เมื่อ Enable ON (ปกติเป็น GND ร่วมกับ pin 3 ตอน OFF) |
 
-> **หมายเหตุ**: Relay A บน custom PCB ต่ออยู่กับ pin 4 (Arduino) และทำหน้าที่ short DB9 pin 4-6 ค้างไว้ตลอด — ห้ามลบ `digitalWrite(RELAY_A, HIGH)` ใน `setup()` และห้ามสั่ง `RELAY_A` ใน `loop()` เด็ดขาด ไม่งั้น pin 6 (Enable) จะไม่ตรงกับ KCMH truth table อีกต่อไป
+> **หมายเหตุ**: Relay A บน custom PCB ต่ออยู่กับ pin 4 (Arduino) ทำหน้าที่ short DB9 pin 4-6 เมื่อ Enable ON — ตั้งแต่การแก้ไขล่าสุด Enable ไม่ใช่ software jumper ที่ค้าง HIGH ตลอดอีกต่อไป แต่ toggle ตามคำสั่ง `E1`/`E0` ที่ส่งมาจาก `_toggle_ready()` ใน `app.py` (กด READY = Enable ON, UNREADY = Enable OFF) เพื่อให้มี human authorization step ก่อน Enable จะขึ้น เทียบเท่ากับ checkbox Enable ของ KCMH-Tricker แทนที่จะ assert ทันทีที่ Arduino มีไฟ — ตอน boot (`setup()`) RELAY_A เริ่มที่ `LOW` เสมอ (fail-safe: ต้องมีคนกด READY ก่อนเท่านั้นถึงจะ Enable ได้)
 
 ---
 

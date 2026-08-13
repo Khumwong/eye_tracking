@@ -17,15 +17,28 @@ except Exception as e:
     print(f"Failed to connect: {e}")
     exit(1)
 
+# วัดที่ DB9 pin 1/3/4/6 ด้วย multimeter เทียบกับ truth table ในเอกสาร TSS ทุกขั้น
+print("[BOOT STATE]  ควรเป็น Beam OFF, Enable OFF  (pin 1+3+6 short กัน)")
+time.sleep(1.5)
+
+print("ENABLE ON  *** RELAY A SHOULD CLICK ***  ควรเป็น {1+3} และ {4+6} แยกกัน")
+s.write(b'E1\n')
+time.sleep(1.5)
+print()
+
 for i in range(CYCLES):
-    print(f"[{i+1}/{CYCLES}]  BEAM ON  *** RELAY SHOULD CLICK ***")
+    print(f"[{i+1}/{CYCLES}]  BEAM ON  *** RELAY B SHOULD CLICK ***  ควรเป็น 1+4+6 รวมกัน")
     s.write(b'B1\n')
     time.sleep(1.5)
 
-    print(f"[{i+1}/{CYCLES}]  BEAM OFF *** RELAY SHOULD CLICK ***")
+    print(f"[{i+1}/{CYCLES}]  BEAM OFF *** RELAY B SHOULD CLICK ***  ควรกลับเป็น {{1+3}} และ {{4+6}} แยกกัน")
     s.write(b'B0\n')
     time.sleep(1.5)
     print()
+
+print("ENABLE OFF *** RELAY A SHOULD CLICK ***  ควรกลับเป็น 1+3+6 short กัน (เหมือน boot state)")
+s.write(b'E0\n')
+time.sleep(1.5)
 
 s.close()
 print("Test complete.")

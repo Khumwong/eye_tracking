@@ -29,11 +29,13 @@ EYE_TRACKING_DEBUG=1 python main.py
 
 ```
 eye_tracking/
-├── main.py        ← จุดเริ่มต้น
-├── app.py         ← UI และการเชื่อมต่อ component
-├── capture.py     ← การจับภาพ / ตรวจจับดวงตา / บันทึกวิดีโอ
-├── arduino.py     ← การสื่อสารกับ Arduino
-└── video/         ← ไฟล์วิดีโอที่บันทึก
+├── main.py              ← จุดเริ่มต้น
+├── app.py               ← UI และการเชื่อมต่อ component
+├── capture.py           ← การจับภาพ / ตรวจจับดวงตา / บันทึกวิดีโอ
+├── arduino.py           ← การสื่อสารกับ Arduino
+├── test_relay.py        ← bench test: วนทุก state อัตโนมัติ (ฟังเสียง relay)
+├── test_relay_hold.py   ← bench test: ค้าง state ไว้จนกด Enter (ใช้ตอนวัด multimeter)
+└── video/               ← ไฟล์วิดีโอที่บันทึก
 ```
 
 ---
@@ -95,12 +97,29 @@ eye_tracking/
 
 | DB9 pin | ความหมาย | ต่อกับอะไร |
 |---|---|---|
-| 1 | Gating Beam ON | Relay B (สลับไป pin 3 ตอน OFF / กลุ่ม pin 4-6 ตอน ON) |
-| 3 | GND | คงที่ |
-| 4 | +12V Ref | Relay A short เข้ากับ pin 6 ตอน Enable ON |
-| 6 | Enable | ต่อกับ pin 4 ผ่าน Relay A เมื่อ Enable ON (ปกติเป็น GND ร่วมกับ pin 3 ตอน OFF) |
+| 1 | Gating Beam ON | Relay B — COM ของ Relay B |
+| 3 | GND | NC ของ relay ทั้งสองตัว |
+| 4 | +12V Ref | **รางจ่ายเฉยๆ** — NO ของ relay ทั้งสองตัว |
+| 6 | Enable | COM ของ Relay A |
 
-> **หมายเหตุ**: Relay A บน custom PCB ต่ออยู่กับ pin 4 (Arduino) ทำหน้าที่ short DB9 pin 4-6 เมื่อ Enable ON — ตั้งแต่การแก้ไขล่าสุด Enable ไม่ใช่ software jumper ที่ค้าง HIGH ตลอดอีกต่อไป แต่ toggle ตามคำสั่ง `E1`/`E0` ที่ส่งมาจาก `_toggle_ready()` ใน `app.py` (กด READY = Enable ON, UNREADY = Enable OFF) เพื่อให้มี human authorization step ก่อน Enable จะขึ้น เทียบเท่ากับ checkbox Enable ของ KCMH-Tricker แทนที่จะ assert ทันทีที่ Arduino มีไฟ — ตอน boot (`setup()`) RELAY_A เริ่มที่ `LOW` เสมอ (fail-safe: ต้องมีคนกด READY ก่อนเท่านั้นถึงจะ Enable ได้)
+**กฎการต่อสายที่ห้ามผิด** — relay แต่ละตัวสลับ **ขาสัญญาณของตัวเอง** (ขา 1 = Beam, ขา 6 = Enable) ระหว่าง GND (ขา 3) กับรางขา 4 เท่านั้น:
+
+| Relay | COM | NC (relay off) | NO (relay on) |
+|---|---|---|---|
+| A (Enable, Arduino D4) | DB9 ขา **6** | DB9 ขา 3 (GND) | DB9 ขา **4** |
+| B (Beam, Arduino D6) | DB9 ขา **1** | DB9 ขา 3 (GND) | DB9 ขา **4** |
+
+> ⚠️ **ขา 4 (+12V Ref) ต้องไม่ถูกสวิตช์และห้ามต่อลง GND เด็ดขาด** — เคยต่อผิดโดยเอา COM ของ Relay A ไว้ที่ขา 4 (สลับระหว่างขา 3 กับขา 6) ซึ่งให้ผลเหมือนกันทุกประการในสถานะ Enable ON จึงไม่มีใครจับได้เลยตลอดที่ Enable ถูก hardwire ค้างไว้ แต่พอเปิดใช้สถานะ Enable OFF จริงจะกลายเป็นการช็อร์ต +12V ของ TSS ลง GND และปล่อยขา 6 (Enable) ลอย — แก้ไปแล้วเมื่อ 2026-08-14 หลังวัดเทียบกับกล่อง FPGA/KCMH
+
+**Truth table ที่ต้องวัดได้** (ตรงกับกล่อง FPGA/KCMH ที่ใช้งานจริง — ใช้ `test_relay_hold.py` ค้าง state ไว้แล้ววัด continuity):
+
+| state | ขาที่ถึงกัน | ขาที่ลอย |
+|---|---|---|
+| Beam OFF, Enable OFF (boot / `E0`) | 1 + 3 + 6 | 4 |
+| Beam OFF, Enable ON (`E1`) | {1+3} และ {4+6} | — |
+| Beam ON, Enable ON (`B1`) | 1 + 4 + 6 | 3 |
+
+> **หมายเหตุเรื่อง Enable**: ตั้งแต่การแก้ไขล่าสุด Enable ไม่ใช่ software jumper ที่ค้าง HIGH ตลอดอีกต่อไป แต่ toggle ตามคำสั่ง `E1`/`E0` ที่ส่งมาจาก `_toggle_ready()` ใน `app.py` (กด READY = Enable ON, UNREADY = Enable OFF) เพื่อให้มี human authorization step ก่อน Enable จะขึ้น เทียบเท่ากับ checkbox Enable ของ KCMH-Tricker แทนที่จะ assert ทันทีที่ Arduino มีไฟ — ตอน boot (`setup()`) RELAY_A เริ่มที่ `LOW` เสมอ (fail-safe: ต้องมีคนกด READY ก่อนเท่านั้นถึงจะ Enable ได้)
 
 ---
 

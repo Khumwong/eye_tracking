@@ -11,6 +11,7 @@ addition to eye_tracking's job, never a precondition for it, so a failure here
 must never block READY/START/STOP or the beam gating they drive.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -212,6 +213,29 @@ def raw_files(outpath):
         return sorted(f for f in os.listdir(outpath) if f.endswith('.raw'))
     except Exception:
         return []
+
+
+def wait_for_running(timeout=40.0):
+    """True once RunControl reports the producers RUNNING.
+
+    Used in place of waiting for the .raw to grow, because the trigger is
+    deliberately not started until the run is up — and with no trigger there is
+    no data to wait for. Scraping the TUI is crude, but RunControl exposes its
+    state nowhere else.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(['tmux', 'capture-pane', '-p', '-t',
+                                  f'{TMUX_SESSION}:rc'],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            out = ''
+        out = re.sub(r'\x1b\[[0-9;]*m', '', out)
+        if re.search(r'ALPIDE_plane_\d\s+RUNNING', out):
+            return True
+        time.sleep(1.0)
+    return False
 
 
 def wait_for_data(outpath, timeout=20.0):

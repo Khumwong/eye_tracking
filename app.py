@@ -1088,8 +1088,11 @@ class EyeTrackingApp:
             messagebox.showerror("Not ready", "กรุณากด READY ก่อนเริ่ม tracking")
             return
         self._set_config_locked(True)
-        self._trigger_on()
-        self._alpide_start()
+        # The trigger only clocks the ALPIDE readout — beam gating runs off the
+        # relays alone — so it is started later, once the run is up, rather than
+        # here. That costs nothing in beam latency and makes the board's pulse
+        # counter share an origin with EUDAQ's trigger number.
+        self._alpide_start(self._trigger_hz_value())
         if self.capture and self.capture.running:
             # preview is already live (camera mode) — just arm the beam relay
             self.capture.armed = True
@@ -1170,13 +1173,21 @@ class EyeTrackingApp:
     # and "no protons" would be indistinguishable from "not looking", which is
     # exactly the comparison the measurement rests on.
 
-    def _trigger_on(self):
+    def _trigger_hz_value(self):
+        """Read and clamp the rate on the UI thread — Tk variables must not be
+        touched from the acquisition worker."""
         try:
             hz = int(self.trigger_hz.get())
         except (tk.TclError, ValueError):
             hz = config.TRIGGER_HZ
         hz = max(1, min(95000, hz))
         self.trigger_hz.set(hz)
+        return hz
+
+    def _trigger_on(self, hz):
+        """Start the readout clock. T1 resets the board's pulse counter, so the
+        moment this is called defines pulse 0 — which is why it is deferred
+        until the EUDAQ2 run is actually running (see _alpide_start)."""
         self.arduino.send(f'TF{hz}\n'.encode())
         self.arduino.send(f'TD{config.TRIGGER_DUTY}\n'.encode())
         self.arduino.send(b'T1\n')
@@ -1243,11 +1254,18 @@ class EyeTrackingApp:
             target=lambda: alpide_daq.install_firmware(on_done=_done),
             daemon=True).start()
 
-    def _alpide_start(self):
+    def _alpide_start(self, hz):
         """Launch acquisition in the background and arm regardless of how it
         goes. Waiting for EUDAQ2 to come up takes ~10 s; holding the beam back
         that long would be worse than losing the first few seconds of detector
-        data, and the transitions being measured repeat throughout the run."""
+        data, and the transitions being measured repeat throughout the run.
+
+        The trigger is started at the end of this, once RunControl reports
+        RUNNING. Doing it here rather than in start() is what makes the pulse
+        counts in beam_events.csv directly comparable with the trigger numbers
+        stored in the .raw: both then count from the same first pulse. Started
+        earlier, the two would differ by however many pulses were emitted while
+        EUDAQ2 was still coming up — about six thousand in one measured run."""
         if self._alpide_pid is not None:
             return
         ts = time.strftime('%Y%m%d_%H%M%S')
@@ -1270,8 +1288,14 @@ class EyeTrackingApp:
                 pid = alpide_daq.start_run(self._alpide_dir)
                 self._alpide_pid = pid
                 self._alpide_note('acquisition starting…')
-                ok = alpide_daq.wait_for_data(self._alpide_dir)
-                self._alpide_note('recording' if ok else 'no data — check rc.log')
+                if not alpide_daq.wait_for_running():
+                    self._alpide_note('run never reached RUNNING — check rc.log')
+                    return
+                self._trigger_on(hz)      # defines pulse 0 == first trigN
+                if alpide_daq.wait_for_data(self._alpide_dir):
+                    self._alpide_note(f'recording @ {hz} Hz')
+                else:
+                    self._alpide_note('running but no data — check rc.log')
             except Exception as e:
                 self._alpide_note(f'start failed: {type(e).__name__}: {e}')
 

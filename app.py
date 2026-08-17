@@ -5,6 +5,7 @@ import queue
 import subprocess
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from datetime import datetime
@@ -1160,20 +1161,34 @@ class EyeTrackingApp:
             self._frame_h, self._frame_w = frame.shape[:2]
             w = max(self.camera_label.winfo_width(),  640)
             h = max(self.camera_label.winfo_height(), 480)
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            scale = min(w / img.width, h / img.height)
+            scale = min(w / self._frame_w, h / self._frame_h)
             self._display_scale = scale
-            self._display_ox = (w - int(img.width  * scale)) // 2
-            self._display_oy = (h - int(img.height * scale)) // 2
-            img = img.resize((int(img.width * scale), int(img.height * scale)),
-                             Image.LANCZOS)
-            tk_img = ImageTk.PhotoImage(image=img)
+            self._display_ox = (w - int(self._frame_w * scale)) // 2
+            self._display_oy = (h - int(self._frame_h * scale)) // 2
+            # Downscale with OpenCV before PIL ever sees the frame. The old
+            # path (PIL fromarray on the full frame, then resize with LANCZOS)
+            # measured 42 ms on a 1080p camera — more than the 30 ms this
+            # callback is scheduled at, so the UI could never catch up and the
+            # picture appeared frozen while the process burned CPU. INTER_AREA
+            # is 2 ms, and the colour conversion then runs on the small image.
+            small = cv2.resize(
+                frame, (max(1, int(self._frame_w * scale)),
+                        max(1, int(self._frame_h * scale))),
+                interpolation=cv2.INTER_AREA)
+            tk_img = ImageTk.PhotoImage(
+                image=Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
             self.camera_label.imgtk = tk_img
             self.camera_label.config(image=tk_img)
         except queue.Empty:
             pass
-        self._tick_heartbeat()
-        self.root.after(30, self._update_frame)
+        except Exception:
+            # Anything unhandled here used to skip the reschedule below and
+            # kill the refresh loop for good — the picture froze while the rest
+            # of the UI stayed alive, giving no clue why.
+            traceback.print_exc()
+        finally:
+            self._tick_heartbeat()
+            self.root.after(30, self._update_frame)
 
     # ── Trigger ────────────────────────────────────
     # Runs continuously while armed and is never gated with the beam: if the
@@ -1434,9 +1449,10 @@ class EyeTrackingApp:
         if self.capture is not None and self.capture.armed \
                 and not self.capture.is_alive():
             self.stop()
-            messagebox.showerror(
-                "Tracking stopped",
-                "Capture thread หยุดทำงาน — disarm และตัดบีมแล้ว")
+            # Not a modal: this runs from the frame loop, and showerror would
+            # block that loop until someone clicked it — freezing the very UI
+            # it is trying to report on.
+            self._alpide_note('capture thread ตาย — disarm และตัดบีมแล้ว')
             return
         self.arduino.send(b'E1\n')
 

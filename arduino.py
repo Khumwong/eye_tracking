@@ -24,29 +24,53 @@ class ArduinoController:
         self._on_line = on_line
         self._reader = None
         self._reading = False
+        self._connecting = False
 
     def connect_async(self, port: str, baud: int, on_done):
-        """Connect in a background thread; call on_done(ok: bool) on completion."""
-        def _work():
-            if not SERIAL_AVAILABLE:
-                on_done(False)
+        """Connect in a background thread; call on_done(ok: bool) on completion.
+
+        Refuses to start a second attempt while one is in flight. Opening the
+        port pulses DTR and resets the board, and an attempt can take up to five
+        seconds — so a caller that retries on a shorter interval (the 2 s status
+        poll does) would reset the board out from under its own handshake,
+        never see READY, and retry forever. The board would sit in a reset loop
+        with its relays dropping each time while the app reported it as merely
+        "not connected yet".
+        """
+        with self._lock:
+            if self._connecting:
                 return
+            if self._serial and self._serial.is_open:
+                on_done(True)
+                return
+            self._connecting = True
+
+        def _work():
             try:
-                s = serial.Serial(port, baud, timeout=3)
-                deadline = time.time() + 5
-                while time.time() < deadline:
-                    line = s.readline().decode('ascii', errors='ignore').strip()
-                    if line == 'READY':
-                        with self._lock:
-                            self._serial = s
-                        self._start_reader()
-                        on_done(True)
-                        return
-                s.close()
-                on_done(False)
-            except Exception:
-                on_done(False)
+                self._connect(port, baud, on_done)
+            finally:
+                self._connecting = False
         threading.Thread(target=_work, daemon=True).start()
+
+    def _connect(self, port, baud, on_done):
+        if not SERIAL_AVAILABLE:
+            on_done(False)
+            return
+        try:
+            s = serial.Serial(port, baud, timeout=3)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = s.readline().decode('ascii', errors='ignore').strip()
+                if line == 'READY':
+                    with self._lock:
+                        self._serial = s
+                    self._start_reader()
+                    on_done(True)
+                    return
+            s.close()
+            on_done(False)
+        except Exception:
+            on_done(False)
 
     def _start_reader(self):
         if self._on_line is None or self._reading:

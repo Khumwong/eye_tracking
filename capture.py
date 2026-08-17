@@ -3,6 +3,7 @@ import csv
 import cv2
 import numpy as np
 import os
+import queue
 import time
 import threading
 
@@ -178,7 +179,15 @@ class CaptureThread:
                 # trigger/threshold/Arduino, only the comparison readouts below
                 gray_bgr = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
                 self._frame_idx += 1
-                if face_mesh_gray and self._frame_idx % self._GRAY_EVERY_N == 0:
+                if (face_mesh_gray and not self.armed
+                        and self._frame_idx % self._GRAY_EVERY_N == 0):
+                    # Skipped entirely while armed. It costs 27 ms on a 1080p
+                    # frame and never touches the trigger, so during a run it
+                    # buys nothing and takes 15% of the decision budget — worse,
+                    # running only every third frame makes the gating period
+                    # irregular, which is exactly what a latency measurement
+                    # must not have. Still runs during preview, where comparing
+                    # the two readings is the point.
                     self._detect_gray_iris(gray_bgr, face_mesh_gray, center)
 
                 # debug CSV + crops
@@ -224,7 +233,17 @@ class CaptureThread:
                         'deviation_mm_gray': self._last_deviation_mm_gray,
                         'view_meta':    view_meta,
                     }
-                    self.queue.put((frame, self.current_state, metrics))
+                    try:
+                        self.queue.put_nowait(
+                            (frame, self.current_state, metrics))
+                    except queue.Full:
+                        # Drop the frame rather than wait for the UI. A blocking
+                        # put throttles this loop to the display rate, and this
+                        # loop is what decides the beam — measured at 15 fps
+                        # (65 ms per decision) while the renderer was the
+                        # bottleneck. Display smoothness must never buy itself
+                        # time out of the gating latency budget.
+                        pass
 
                 if self.is_video:
                     dt = (frame_delay / self.params.get('speed', 1.0)) - (time.time() - t0)

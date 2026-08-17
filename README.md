@@ -99,13 +99,29 @@ eye_tracking/
 | คำสั่ง | ผล |
 |---|---|
 | `B1` / `B0` | Beam relay เปิด/ปิด (ส่งทุกเฟรมจาก `capture.py` ตามตำแหน่งตา) |
-| `E1` / `E0` | Enable relay เปิด/ปิด (ส่งจาก `_toggle_ready()` ตอนกด READY/UNREADY) |
+| `E1` / `E0` | Enable relay เปิด/ปิด (ส่งจาก `_toggle_ready()` ตอนกด READY/UNREADY และส่งซ้ำเป็น heartbeat) |
+| `H` | heartbeat — refresh watchdog เฉยๆ ไม่เปลี่ยนสถานะอะไร (ใช้ในเครื่องมือ bench) |
 | `T1` / `T0` | ALPIDE trigger เปิด/ปิด |
 | `TF<hz>` | ตั้งความถี่ trigger 1–95000 Hz (เช่น `TF9500`) |
 | `TD<pct>` | ตั้ง duty cycle 1–99 % (เช่น `TD50`) |
 | `T?` | พิมพ์ค่า trigger ปัจจุบัน (ใช้ debug บนโต๊ะเท่านั้น — แอปไม่เคยส่งและไม่เคยอ่าน reply) |
 | `TSH` / `TSL` | สั่ง D7 เป็น HIGH/LOW ค้างโดยไม่ผ่าน timer (debug บนโต๊ะ — แยกปัญหาสายกับปัญหาโค้ด timer) |
 | `TR?` | dump ค่า register ของ Timer4 จริงจากชิป (debug บนโต๊ะ) |
+
+### Relay watchdog
+
+**การปิด serial port ไม่ได้ reset บอร์ด** (พิสูจน์แล้วบนของจริง) เพราะงั้นถ้าไม่มี watchdog แอปที่ crash หรือค้างจะทิ้ง relay ค้างสถานะเดิมไว้ — รวมถึง Enable ที่ค้าง ON โดยไม่มีใครคุม
+
+เฟิร์มแวร์จึงมี watchdog: **ถ้าไม่ได้รับคำสั่งใดๆ เกิน 2 วินาที relay ทั้งสองตัวจะตกลงสถานะปลอดภัย** แล้วค้างอยู่แบบนั้นจนกว่า host จะสั่งใหม่ (ไม่คืนสถานะเองอัตโนมัติ)
+
+ฝั่ง host ส่งเจตนาซ้ำเป็นระยะแบบ idempotent ไม่ใช่แค่ ping เปล่า:
+- `app.py` → `_tick_heartbeat()` ส่ง `E1` ทุก ~360 ms ขณะ READY
+- `capture.py` → ส่งสถานะบีมเดิมซ้ำทุก 10 เฟรม (`_BEAM_REFRESH_N`) เพิ่มจากการส่งตอนเปลี่ยนสถานะ
+- ผลคือฮาร์ดแวร์จะ converge เข้าหาสิ่งที่ซอฟต์แวร์ต้องการเสมอ ถ้า watchdog เคยตัดไปแล้วก็กลับมาถูกต้องเอง
+
+**ถ้า capture thread ตายขณะ armed** `_tick_heartbeat()` จะหยุดส่ง heartbeat แล้วเรียก `stop()` + แจ้งเตือน — เพราะแอปไม่มีสิทธิ์อ้างสถานะบีมอีกต่อไปเมื่อ thread ที่ตัดสินใจตายแล้ว
+
+> **watchdog คุมแค่ relay ไม่คุม trigger** — trigger เป็นนาฬิกา readout ของ detector ไม่ใช่ส่วนของ interlock และถ้าให้ timeout 2 วิไปคุมด้วย เครื่องมือวัดบนโต๊ะที่ค้างสถานะเป็นนาทีจะใช้ไม่ได้
 
 ### ALPIDE trigger (J1)
 

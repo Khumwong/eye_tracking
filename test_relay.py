@@ -1,4 +1,5 @@
 import serial
+import threading
 import time
 
 PORT = '/dev/ttyUSB1'
@@ -16,6 +17,17 @@ try:
 except Exception as e:
     print(f"Failed to connect: {e}")
     exit(1)
+
+# Each step below sits just inside the firmware's ~2 s relay watchdog; a
+# heartbeat makes that margin explicit instead of relying on the sleep length.
+def _beat():
+    while True:
+        try:
+            s.write(b'H\n')
+        except Exception:
+            return
+        time.sleep(0.5)
+threading.Thread(target=_beat, daemon=True).start()
 
 # วัดที่ DB9 pin 1/3/4/6 ด้วย multimeter เทียบกับ truth table ในเอกสาร TSS ทุกขั้น
 print("[BOOT STATE]  ควรเป็น Beam OFF, Enable OFF  (pin 1+3+6 short กัน)")

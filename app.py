@@ -1117,7 +1117,35 @@ class EyeTrackingApp:
             self.camera_label.config(image=tk_img)
         except queue.Empty:
             pass
+        self._tick_heartbeat()
         self.root.after(30, self._update_frame)
+
+    # ── Watchdog heartbeat ─────────────────────────
+    # The Arduino drops both relays if it hears nothing for WATCHDOG_MS (see
+    # eye_tracking_beam.ino), so a crashed or hung app can no longer leave
+    # Enable asserted. Re-asserting E1 rather than sending a bare ping keeps it
+    # idempotent: if the watchdog ever did trip, the relay comes back to what
+    # the app actually intends instead of staying stale.
+
+    _HEARTBEAT_EVERY = 12          # _update_frame ticks (~30 ms each) ≈ 360 ms
+
+    def _tick_heartbeat(self):
+        self._hb_count = getattr(self, '_hb_count', 0) + 1
+        if self._hb_count % self._HEARTBEAT_EVERY:
+            return
+        if not self.ready:
+            return              # nothing asserted — let the watchdog idle
+        # Armed means CaptureThread owns the beam decision. If that thread has
+        # died the app can no longer honestly claim the beam state, so stop
+        # feeding the watchdog and disarm — dropping the relays is correct.
+        if self.capture is not None and self.capture.armed \
+                and not self.capture.is_alive():
+            self.stop()
+            messagebox.showerror(
+                "Tracking stopped",
+                "Capture thread หยุดทำงาน — disarm และตัดบีมแล้ว")
+            return
+        self.arduino.send(b'E1\n')
 
     # ── Close ──────────────────────────────────────
 

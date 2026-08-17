@@ -116,6 +116,7 @@ class CaptureThread:
     # ── Internal loop ─────────────────────────────────────────
 
     _GRAY_EVERY_N = 3   # throttle: run the grayscale cross-check every Nth frame
+    _BEAM_REFRESH_N = 10  # re-send the unchanged beam state every Nth frame
 
     def _loop(self):
         face_mesh = None
@@ -192,6 +193,13 @@ class CaptureThread:
                 elif not armed_trigger and self.current_state != 'S':
                     self.arduino.send(b'B0\n')
                     self.current_state = 'S'
+                elif self._frame_idx % self._BEAM_REFRESH_N == 0:
+                    # Re-state the unchanged decision periodically. On-change
+                    # alone can go silent for minutes while the eye holds still,
+                    # which the Arduino watchdog would read as a dead host — and
+                    # if it ever did trip, this is what restores the relay to
+                    # the current decision instead of leaving it stale.
+                    self.arduino.send(b'B1\n' if armed_trigger else b'B0\n')
 
 
                 if self.is_video and self._total > 0 and self._seek < 0:

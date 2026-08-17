@@ -23,6 +23,7 @@
 //
 // Commands: B1\n = Beam ON,    B0\n = Beam OFF
 //           E1\n = Enable ON,  E0\n = Enable OFF
+//           H\n  = heartbeat (refreshes the relay watchdog, changes nothing)
 //           T1\n = Trigger ON, T0\n = Trigger OFF
 //           TF<hz>\n   set trigger frequency, 1..95000 Hz   (e.g. TF9500)
 //           TD<pct>\n  set trigger duty cycle, 1..99 %      (e.g. TD50)
@@ -37,11 +38,31 @@
 #define RELAY_B  6
 #define TRIG_PIN 7
 
+// Relay watchdog. Closing the serial port does NOT reset this board, so
+// without this a crashed or hung host leaves both relays frozen in whatever
+// state they were last commanded into — including Enable asserted with the
+// DB9 live. Any recognised command refreshes the timer; if none arrives for
+// WATCHDOG_MS the relays drop to the safe state and stay there until the host
+// asserts them again. The host re-sends its intent periodically (see
+// _send_heartbeat in app.py and the periodic B-state refresh in capture.py),
+// so the hardware always converges on what the software actually wants.
+//
+// Deliberately guards the relays only, not the trigger: the trigger is a
+// detector readout clock, not part of the beam interlock, and leaving it
+// running costs nothing while a 2 s timeout would make bench measurements
+// (which hold one state for minutes) unusable.
+#define WATCHDOG_MS 2000UL
+
 String input = "";
 
 unsigned long trig_hz   = 9500;   // KCMH-Tricker's default readout frequency
 uint8_t       trig_duty = 50;
 bool          trig_on   = false;
+
+bool          enable_on = false;
+bool          beam_on   = false;
+unsigned long last_cmd_ms = 0;
+bool          wd_tripped  = false;
 
 // Program Timer4 for the current frequency/duty without touching channel A.
 // Fast PWM mode 14: TOP = ICR4, so OCR4A stays free and D6 is unaffected.
@@ -98,24 +119,47 @@ void setup() {
   digitalWrite(RELAY_A,  LOW);   // Enable OFF until host sends E1
   digitalWrite(RELAY_B,  LOW);
   digitalWrite(TRIG_PIN, LOW);   // trigger OFF until host sends T1
+  enable_on = false;
+  beam_on   = false;
+  last_cmd_ms = millis();
   input.reserve(16);
   delay(100);
   Serial.println("READY");
 }
 
 void loop() {
+  if (!wd_tripped && (enable_on || beam_on) &&
+      (millis() - last_cmd_ms) > WATCHDOG_MS) {
+    digitalWrite(RELAY_B, LOW);        // beam first, then enable
+    digitalWrite(RELAY_A, LOW);
+    beam_on   = false;
+    enable_on = false;
+    wd_tripped = true;
+    Serial.println("WATCHDOG: host silent, relays dropped to safe state");
+  }
+
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n') {
       input.trim();
+      if (input.length()) {
+        last_cmd_ms = millis();
+        wd_tripped  = false;
+      }
       if (input == "B1") {
         digitalWrite(RELAY_B, HIGH);
+        beam_on = true;
       } else if (input == "B0") {
         digitalWrite(RELAY_B, LOW);
+        beam_on = false;
       } else if (input == "E1") {
         digitalWrite(RELAY_A, HIGH);
+        enable_on = true;
       } else if (input == "E0") {
         digitalWrite(RELAY_A, LOW);
+        enable_on = false;
+      } else if (input == "H") {
+        // heartbeat: nothing to do, refreshing last_cmd_ms above is the point
       } else if (input == "T1") {
         trig_on = true;
         trigStart();
@@ -163,7 +207,12 @@ void loop() {
         Serial.print(trig_hz);
         Serial.print("Hz ");
         Serial.print(trig_duty);
-        Serial.println("%");
+        Serial.print("%  enable=");
+        Serial.print(enable_on ? "1" : "0");
+        Serial.print(" beam=");
+        Serial.print(beam_on ? "1" : "0");
+        Serial.print(" wd_tripped=");
+        Serial.println(wd_tripped ? "1" : "0");
       }
       input = "";
     } else {

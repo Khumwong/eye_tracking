@@ -6,6 +6,8 @@ several pin pairs — this one waits for Enter between states instead.
 """
 import serial
 import sys
+import threading
+import time
 
 PORT = '/dev/ttyUSB1'   # Arduino = CH340 (1a86:7523). ttyUSB0 คือ Zaber — อย่าสับสน
 BAUD = 9600
@@ -31,6 +33,21 @@ def show(label, expect):
         print(f"        pin {pair:5s} {mark}")
 
 
+def start_heartbeat(ser, lock):
+    """The firmware drops the relays if it hears nothing for ~2 s, so a state
+    held open across an input() wait needs a heartbeat or it would silently
+    disappear mid-measurement."""
+    def _beat():
+        while True:
+            with lock:
+                try:
+                    ser.write(b'H\n')
+                except Exception:
+                    return
+            time.sleep(0.5)
+    threading.Thread(target=_beat, daemon=True).start()
+
+
 def main():
     print(f"Connecting to {PORT}...")
     try:
@@ -40,6 +57,9 @@ def main():
         return 1
     line = s.readline().decode('ascii', errors='ignore').strip()
     print("Arduino READY\n" if line == 'READY' else f"Got: '{line}' (continuing anyway)\n")
+
+    lock = threading.Lock()
+    start_heartbeat(s, lock)
 
     print("ถอด DB9 ออกจาก TSS ก่อนวัด — multimeter โหมด continuity")
     try:
@@ -57,16 +77,18 @@ def main():
                 continue
 
             label, cmds, expect = STATES[choice]
-            for c in cmds:
-                s.write(c)
+            with lock:
+                for c in cmds:
+                    s.write(c)
             show(label, expect)
             input("\n      วัดให้เสร็จแล้วกด Enter เพื่อกลับไปเลือก state ถัดไป...")
     except (KeyboardInterrupt, EOFError):
         print()
     finally:
         # always leave the board in the safe state
-        s.write(b'B0\n')
-        s.write(b'E0\n')
+        with lock:
+            s.write(b'B0\n')
+            s.write(b'E0\n')
         s.close()
         print("\nกลับสู่ Beam OFF / Enable OFF แล้ว — ปิด port เรียบร้อย")
     return 0

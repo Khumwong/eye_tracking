@@ -1406,7 +1406,8 @@ class EyeTrackingApp:
         try:
             os.makedirs(folder, exist_ok=True)
             self._ev_log = open(os.path.join(folder, 'beam_events.csv'), 'w')
-            self._ev_log.write('host_time_iso,host_monotonic,event,pulse\n')
+            self._ev_log.write(
+                'host_time_iso,host_monotonic,event,pulse,trig_running\n')
             self._ev_log.flush()
         except Exception:
             self._ev_log = None
@@ -1425,14 +1426,16 @@ class EyeTrackingApp:
             print(f'[Arduino] {line}')
             return
         parts = line.split()
-        if len(parts) != 3:
+        if len(parts) != 4:
             return
-        _, ev, pulse = parts
+        _, ev, pulse, running = parts
         if self._ev_log:
             try:
+                # trig_running=0 means the pulse column is a leftover count from
+                # a previous run and cannot be matched against the .raw
                 self._ev_log.write(
                     f'{datetime.now().isoformat()},{time.monotonic():.6f},'
-                    f'{ev},{pulse}\n')
+                    f'{ev},{pulse},{running}\n')
                 self._ev_log.flush()
             except Exception:
                 pass

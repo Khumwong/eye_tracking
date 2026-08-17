@@ -1,5 +1,6 @@
 import collections
 import csv
+from datetime import datetime
 import cv2
 import numpy as np
 import os
@@ -79,6 +80,8 @@ class CaptureThread:
 
         self._recording = False
         self._writer = None
+        self._ts_file = None
+        self._rec_frame_idx = 0
         self._writer_lock = threading.Lock()
         self._thread = None
 
@@ -112,6 +115,18 @@ class CaptureThread:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         with self._writer_lock:
             self._writer = cv2.VideoWriter(path, fourcc, self._fps, (w, h))
+            # The writer is told the camera's nominal rate, but frames arrive at
+            # whatever rate detection manages — 27 fps against a claimed 50 in
+            # one measured run, so the file plays back at nearly twice real
+            # speed and its timestamps mean nothing. Rather than guess a better
+            # number, log when each frame was actually written: correlating a
+            # beam event with the picture then needs no fps at all.
+            try:
+                self._ts_file = open(os.path.splitext(path)[0] + '_frames.csv', 'w')
+                self._ts_file.write('frame,host_time_iso,host_monotonic\n')
+            except Exception:
+                self._ts_file = None
+            self._rec_frame_idx = 0
             self._recording = True
 
     def stop_recording(self):
@@ -120,6 +135,12 @@ class CaptureThread:
             if self._writer:
                 self._writer.release()
                 self._writer = None
+            if self._ts_file:
+                try:
+                    self._ts_file.close()
+                except Exception:
+                    pass
+                self._ts_file = None
 
     # ── Internal loop ─────────────────────────────────────────
 
@@ -229,6 +250,15 @@ class CaptureThread:
                     with self._writer_lock:
                         if self._writer:
                             self._writer.write(raw)
+                            if self._ts_file:
+                                try:
+                                    self._ts_file.write(
+                                        f'{self._rec_frame_idx},'
+                                        f'{datetime.now().isoformat()},'
+                                        f'{time.monotonic():.6f}\n')
+                                except Exception:
+                                    pass
+                            self._rec_frame_idx += 1
 
                 if not self.queue.full():
                     metrics = {

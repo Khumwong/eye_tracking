@@ -25,8 +25,10 @@
 //           E1\n = Enable ON,  E0\n = Enable OFF
 //           H\n  = heartbeat (refreshes the relay watchdog, changes nothing)
 //
-// Replies: the board prints "EV B1 <n>" / "EV B0 <n>" whenever the beam state
-//          actually changes, where <n> is the trigger pulse count since T1.
+// Replies: the board prints "EV B1 <n> <t>" / "EV B0 <n> <t>" whenever the beam
+//          state actually changes, where <n> is the trigger pulse count since
+//          T1 and <t> is 1 only if the trigger was running — <n> is a stale
+//          leftover otherwise, since T0 does not clear the counter.
 //          That count is the shared clock with the ALPIDE data — see
 //          trig_pulses below. Periodic B1/B0 refreshes are not echoed.
 //           T1\n = Trigger ON, T0\n = Trigger OFF
@@ -76,6 +78,22 @@ bool          beam_on   = false;
 volatile unsigned long trig_pulses = 0;
 
 ISR(TIMER4_OVF_vect) { trig_pulses++; }
+
+// Report a beam transition with the pulse count AND whether the trigger was
+// actually running. T0 stops the trigger without clearing the counter, so a
+// transition logged before T1 carries a leftover count from the previous run —
+// a number that looks usable but means nothing. The flag is what tells the
+// analysis which rows can be matched against the ALPIDE data.
+unsigned long pulseCount();          // defined below
+
+void reportEvent(const char *what) {
+  Serial.print("EV ");
+  Serial.print(what);
+  Serial.print(' ');
+  Serial.print(pulseCount());
+  Serial.print(' ');
+  Serial.println(trig_on ? 1 : 0);
+}
 
 unsigned long pulseCount() {
   unsigned long v;
@@ -163,7 +181,7 @@ void loop() {
       (millis() - last_cmd_ms) > WATCHDOG_MS) {
     digitalWrite(RELAY_B, LOW);        // beam first, then enable
     digitalWrite(RELAY_A, LOW);
-    if (beam_on) { Serial.print("EV B0 "); Serial.println(pulseCount()); }
+    if (beam_on) { reportEvent("B0"); }
     beam_on   = false;
     enable_on = false;
     wd_tripped = true;
@@ -180,11 +198,11 @@ void loop() {
       }
       if (input == "B1") {
         digitalWrite(RELAY_B, HIGH);
-        if (!beam_on) { Serial.print("EV B1 "); Serial.println(pulseCount()); }
+        if (!beam_on) { reportEvent("B1"); }
         beam_on = true;
       } else if (input == "B0") {
         digitalWrite(RELAY_B, LOW);
-        if (beam_on) { Serial.print("EV B0 "); Serial.println(pulseCount()); }
+        if (beam_on) { reportEvent("B0"); }
         beam_on = false;
       } else if (input == "E1") {
         digitalWrite(RELAY_A, HIGH);

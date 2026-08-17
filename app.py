@@ -1,4 +1,5 @@
 import cv2
+import json
 import os
 import queue
 import subprocess
@@ -50,6 +51,7 @@ class EyeTrackingApp:
         self._alpide_busy    = False   # a firmware flash is running
         self._alpide_msg     = 'idle'
         self._ev_log         = None    # open CSV correlating beam <-> pulses
+        self._session_root   = ''      # output/session_<ts> for this run
         self.trigger_hz      = tk.IntVar(value=config.TRIGGER_HZ)
 
         self.eye_side       = tk.StringVar(value='left')
@@ -721,8 +723,7 @@ class EyeTrackingApp:
 
     def _start_rec(self):
         ts = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(os.path.dirname(__file__), 'video',
-                            f"eye_tracking_{ts}.mp4")
+        path = os.path.join(self._session_dir('video'), f"eye_tracking_{ts}.mp4")
         self.capture.start_recording(path)
         self._rec_path = path
         self._rec_start_time = time.time()
@@ -773,9 +774,7 @@ class EyeTrackingApp:
         import datetime
         if not self._debug_active:
             ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            folder = os.path.join(os.path.dirname(__file__),
-                                  'debug', f'session_{ts}')
-            os.makedirs(folder, exist_ok=True)
+            folder = self._session_dir('debug')
             self.capture._debug_folder   = folder
             self.capture._debug_frame_idx = 0
             self.capture.debug_enabled   = True
@@ -784,7 +783,7 @@ class EyeTrackingApp:
                                    bg=AMBERB, fg=AMBERL,
                                    activebackground=AMBERB, activeforeground=AMBERL)
             self._debug_lbl.config(
-                text=f"→ debug/session_{ts}", fg=AMBERL)
+                text=f"→ {os.path.basename(self._session_root)}/debug", fg=AMBERL)
         else:
             self.capture.debug_enabled = False
             self._debug_active = False
@@ -1088,6 +1087,11 @@ class EyeTrackingApp:
             messagebox.showerror("Not ready", "กรุณากด READY ก่อนเริ่ม tracking")
             return
         self._set_config_locked(True)
+        # a fresh folder per run, unless RECORD/debug already opened one
+        if not self._session_root:
+            self._session_dir()
+        self._session_started = datetime.now().isoformat()
+        self._write_session_json()
         # The trigger only clocks the ALPIDE readout — beam gating runs off the
         # relays alone — so it is started later, once the run is up, rather than
         # here. That costs nothing in beam latency and makes the board's pulse
@@ -1111,6 +1115,10 @@ class EyeTrackingApp:
         self._set_config_locked(False)
         self.arduino.send(b'T0\n')
         self._alpide_stop()
+        if self._session_root:
+            self._write_session_json(stopped=datetime.now().isoformat())
+            print(f'[SESSION] {self._session_root}')
+            self._session_root = ''    # next run starts a new folder
         if self.capture:
             self.capture.armed = False
 
@@ -1192,6 +1200,57 @@ class EyeTrackingApp:
         self.arduino.send(f'TD{config.TRIGGER_DUTY}\n'.encode())
         self.arduino.send(b'T1\n')
 
+    # ── Session output folder ──────────────────────
+    # One timestamped folder per run holds everything that run produced, split
+    # by kind. Reviewing an experiment afterwards is then a single directory
+    # rather than three scattered ones that have to be matched up by filename
+    # timestamps.
+    #
+    #   output/session_<ts>/
+    #     ├── alpide/   run*.raw + beam_events.csv   (the latency measurement)
+    #     ├── video/    eye_tracking_*.mp4           (RECORD)
+    #     ├── debug/    log.csv + crop_*.jpg         (debug mode only)
+    #     └── session.json                           (settings + timing)
+
+    def _session_dir(self, sub=None):
+        """Path inside the current run's folder, creating it on first use.
+
+        RECORD and debug can both be started outside a START..STOP window, so
+        the folder is created on demand rather than only at START — otherwise
+        those files would have nowhere to go."""
+        if not self._session_root:
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            self._session_root = os.path.join(
+                os.path.dirname(__file__), config.OUTPUT_DIR, f'session_{ts}')
+        path = os.path.join(self._session_root, sub) if sub else self._session_root
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _write_session_json(self, **extra):
+        """Snapshot of what produced the data. Without this the .raw and the CSV
+        are unreadable a week later — nothing else records which eye was
+        tracked, where the target was, or what threshold was in force."""
+        info = {
+            'started':        getattr(self, '_session_started', None),
+            'eye_side':       self.eye_side.get(),
+            'detect_method':  self.detect_method.get(),
+            'threshold_mm':   self.threshold_mm.get(),
+            'target_x':       self.center_x.get(),
+            'target_y':       self.center_y.get(),
+            'trigger_hz':     self.trigger_hz.get(),
+            'trigger_duty':   config.TRIGGER_DUTY,
+            'alpide_num':     config.ALPIDE_NUM,
+            'alpide_events':  config.ALPIDE_EVENTS,
+            'alpide_strobe':  config.ALPIDE_STROBE,
+            'alpide_ithr':    config.ALPIDE_ITHR,
+        }
+        info.update(extra)
+        try:
+            with open(os.path.join(self._session_dir(), 'session.json'), 'w') as f:
+                json.dump(info, f, indent=2)
+        except Exception:
+            pass
+
     # ── ALPIDE acquisition ─────────────────────────
     # Every entry point here is best-effort: ALPIDE recording is additive to
     # eye_tracking's job, so nothing in this section may block or delay READY,
@@ -1268,9 +1327,7 @@ class EyeTrackingApp:
         EUDAQ2 was still coming up — about six thousand in one measured run."""
         if self._alpide_pid is not None:
             return
-        ts = time.strftime('%Y%m%d_%H%M%S')
-        self._alpide_dir = os.path.join(os.path.dirname(__file__),
-                                        'alpide_output', f'session_{ts}')
+        self._alpide_dir = self._session_dir('alpide')
         self._open_ev_log(self._alpide_dir)
 
         def _work():

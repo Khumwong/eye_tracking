@@ -17,6 +17,12 @@ DEFAULT_THRESHOLD_MM = 3.0
 TARGET_MARK_PX   = 8   # half-length of the fixed crosshair at the target point
 DETECTED_MARK_PX = 3   # radius of the dot marking the measured eye position
 
+# ── Output ───────────────────────────────────────────
+# Everything a session produces lands under one timestamped folder here, so
+# reviewing an experiment afterwards means opening one directory rather than
+# hunting through three.
+OUTPUT_DIR = 'output'
+
 # ── ALPIDE / EUDAQ2 acquisition ──────────────────────
 # Kept here rather than in the UI: these change per experiment campaign, not per
 # session, and putting them on screen invites fiddling mid-treatment.

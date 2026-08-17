@@ -51,6 +51,7 @@ class EyeTrackingApp:
         self._alpide_dir     = ''
         self._alpide_busy    = False   # a firmware flash is running
         self._alpide_msg     = 'idle'
+        self._alpide_failed  = 'not started'   # None once recording is confirmed
         self._ev_log         = None    # open CSV correlating beam <-> pulses
         self._session_root   = ''      # output/session_<ts> for this run
         self.trigger_hz      = tk.IntVar(value=config.TRIGGER_HZ)
@@ -1267,6 +1268,10 @@ class EyeTrackingApp:
             'alpide_events':  config.ALPIDE_EVENTS,
             'alpide_strobe':  config.ALPIDE_STROBE,
             'alpide_ithr':    config.ALPIDE_ITHR,
+            # None means detector data was really recorded; anything else says
+            # why it was not, so a run that produced no .raw says so in its own
+            # folder instead of looking like every other run
+            'alpide_error':   self._alpide_failed,
         }
         info.update(extra)
         try:
@@ -1356,29 +1361,39 @@ class EyeTrackingApp:
 
         def _work():
             try:
-                if alpide_daq.session_active():
-                    # shared machine-wide resources: the ITS3 tmux session and
-                    # the six boards. Racing a session that KCMH-Tricker (or a
-                    # crashed run) still owns would corrupt both.
-                    self._alpide_note('ITS3 session already running — skipped')
+                state = alpide_daq.session_state()
+                if state == 'running':
+                    # genuinely acquiring — the ITS3 session and the six boards
+                    # are machine-wide, and racing KCMH-Tricker would corrupt
+                    # both runs
+                    self._alpide_note('ITS3 กำลังใช้งานอยู่ — ไม่ได้บันทึก')
+                    self._alpide_failed = 'ITS3 session busy'
                     return
-                state, msg = alpide_daq.status()
-                if state != 'ready':
-                    self._alpide_note(f'not recording ({msg})')
+                if state == 'stale':
+                    self._alpide_note('เก็บกวาด ITS3 session ที่ค้างอยู่')
+                    alpide_daq.kill_session()
+                    time.sleep(2)
+                bstate, msg = alpide_daq.status()
+                if bstate != 'ready':
+                    self._alpide_note(f'ไม่ได้บันทึก ({msg})')
+                    self._alpide_failed = msg
                     return
                 pid = alpide_daq.start_run(self._alpide_dir)
                 self._alpide_pid = pid
                 self._alpide_note('acquisition starting…')
                 if not alpide_daq.wait_for_running():
-                    self._alpide_note('run never reached RUNNING — check rc.log')
+                    self._alpide_note('run ไม่ขึ้นสถานะ RUNNING — ดู rc.log')
+                    self._alpide_failed = 'never reached RUNNING'
                     return
                 self._trigger_on(hz)      # defines pulse 0 == first trigN
                 if alpide_daq.wait_for_data(self._alpide_dir):
                     self._alpide_note(f'recording @ {hz} Hz')
                 else:
                     self._alpide_note('running but no data — check rc.log')
+                self._alpide_failed = None
             except Exception as e:
                 self._alpide_note(f'start failed: {type(e).__name__}: {e}')
+                self._alpide_failed = f'{type(e).__name__}: {e}'
 
         threading.Thread(target=_work, daemon=True).start()
 

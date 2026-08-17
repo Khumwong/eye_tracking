@@ -152,7 +152,11 @@ Arduino รู้ทั้งสองอย่าง — รับคำสั�
 1. **EUDAQ2 รันใน venv ของ eye_tracking ไม่ได้** — สคริปต์ใช้ `#!/usr/bin/env python3` และต้องการ `urwid` + `alpidedaqboard` (editable install) จาก user site-packages ซึ่ง venv ไม่มี `alpide_daq.clean_env()` ถอด `VIRTUAL_ENV`/`PATH` ของ venv ออกก่อน spawn ทุกครั้ง
    **แย่กว่านั้น: tmux pane สืบทอด env จาก tmux server ตัวที่เริ่มไว้ก่อน** เพราะงั้นถ้า launch ครั้งแรกด้วย env ที่ปนเปื้อน มันจะพังซ้ำๆ จนกว่าจะ `tmux kill-server`
 2. **FX3 firmware อยู่ใน RAM** บอร์ดกลับเป็น DFU mode ทุกครั้งที่ไฟหลุดหรือ run ถูกตัดกลางคัน — ต้อง flash ทุก session (แอปทำให้อัตโนมัติตอน READY)
-3. **tmux session ชื่อ `ITS3` กับบอร์ด 6 ตัวเป็นทรัพยากรร่วมกับ KCMH-Tricker** — แอปเช็ค `session_active()` แล้วข้ามการ launch ถ้ามี session อยู่แล้ว **ห้ามรัน acquisition สองแอปพร้อมกัน**
+3. **tmux session ชื่อ `ITS3` กับบอร์ด 6 ตัวเป็นทรัพยากรร่วมกับ KCMH-Tricker** — **ห้ามรัน acquisition สองแอปพร้อมกัน**
+
+   `session_state()` แยก session ที่**กำลังทำงานจริง** (producer ครบ 6) ออกจาก**ซากที่ค้าง** (run จบหรือ crash แล้วแต่ tmux ยังอยู่) — ซากจะถูกเก็บกวาดอัตโนมัติแล้ว launch ต่อ ส่วน session ที่ทำงานอยู่จริงจะไม่แตะ
+
+   เดิมเช็คแค่ "มี session ไหม" ซึ่งทำให้**ซากที่ตายแล้วบล็อกทุก run ถัดไปเงียบๆ** — แอปยังเขียนไฟล์ครบ ดูปกติทุกอย่าง แต่ไม่มี `.raw` เลย และรู้ตัวตอนมาวิเคราะห์ (เสีย run 59 วินาทีไปหนึ่งครั้ง)
 
 ### ค่าที่ตั้งใน `config.py`
 

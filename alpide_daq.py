@@ -156,6 +156,43 @@ def session_active():
         return False
 
 
+def _producer_count():
+    try:
+        out = subprocess.run(['pgrep', '-fc', 'ALPIDEProducer'],
+                             capture_output=True, text=True, timeout=5).stdout
+        return int(out.strip() or 0)
+    except Exception:
+        return 0
+
+
+def session_state():
+    """'none' | 'running' | 'stale'.
+
+    A finished or crashed run can leave the ITS3 tmux session behind with a
+    couple of orphaned processes. Treating that as "busy" silently disables
+    recording for every later run — the app still writes its files and looks
+    fine, and the loss only surfaces when the data is analysed. So distinguish
+    a session that is genuinely acquiring (all producers up) from a leftover
+    shell, which is safe to clear away.
+    """
+    if not session_active():
+        return 'none'
+    return 'running' if _producer_count() >= config.ALPIDE_NUM else 'stale'
+
+
+def kill_session():
+    try:
+        subprocess.run(['tmux', 'kill-session', '-t', TMUX_SESSION],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+    for pat in ('ALPIDEProducer', 'ITS3DataCollector', 'ITS3RunControl'):
+        try:
+            subprocess.run(['pkill', '-f', pat], capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+
 def start_run(outpath, num_alpides=None, num_events=None, strobe=None, ithr=None):
     """Generate the EUDAQ2 config and launch the run. Returns the pid.
 

@@ -89,6 +89,13 @@ class CaptureThread:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def is_alive(self):
+        """Whether the detection loop is still running. This class owns a
+        thread rather than being one, so callers cannot rely on Thread's own
+        is_alive — and a caller that assumed otherwise silently killed the UI
+        refresh loop."""
+        return bool(self._thread and self._thread.is_alive())
+
     def stop(self):
         self.running = False
         self.pause_event.set()

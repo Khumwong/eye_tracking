@@ -1187,7 +1187,16 @@ class EyeTrackingApp:
             # of the UI stayed alive, giving no clue why.
             traceback.print_exc()
         finally:
-            self._tick_heartbeat()
+            # The reschedule has to be the one thing that cannot be skipped:
+            # anything raising above it stops the frame loop for good and the
+            # picture freezes with no other sign. That is exactly what happened
+            # when _tick_heartbeat called is_alive() on CaptureThread, which is
+            # not a Thread — and only while armed, so it froze the instant
+            # START was pressed.
+            try:
+                self._tick_heartbeat()
+            except Exception:
+                traceback.print_exc()
             self.root.after(30, self._update_frame)
 
     # ── Trigger ────────────────────────────────────

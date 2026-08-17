@@ -91,7 +91,29 @@ eye_tracking/
 | Baud Rate | 9600 |
 | **Relay Pin (A)** | **Digital Pin 4** — Enable, toggle ตาม E0/E1 (เริ่มที่ LOW ตอน boot — fail-safe) |
 | **Relay Pin (B)** | **Digital Pin 6** — Beam, toggle ตาม B0/B1 |
+| **Trigger Pin** | **Digital Pin 7** → J1 (coax 5V) — ALPIDE readout clock, toggle ตาม T0/T1 (เริ่มที่ LOW ตอน boot) |
 | Sketch | `arduino_sketch/eye_tracking_beam/eye_tracking_beam.ino` |
+
+### คำสั่ง serial ทั้งหมด
+
+| คำสั่ง | ผล |
+|---|---|
+| `B1` / `B0` | Beam relay เปิด/ปิด (ส่งทุกเฟรมจาก `capture.py` ตามตำแหน่งตา) |
+| `E1` / `E0` | Enable relay เปิด/ปิด (ส่งจาก `_toggle_ready()` ตอนกด READY/UNREADY) |
+| `T1` / `T0` | ALPIDE trigger เปิด/ปิด |
+| `TF<hz>` | ตั้งความถี่ trigger 1–95000 Hz (เช่น `TF9500`) |
+| `TD<pct>` | ตั้ง duty cycle 1–99 % (เช่น `TD50`) |
+| `T?` | พิมพ์ค่า trigger ปัจจุบัน (ใช้ debug บนโต๊ะเท่านั้น — แอปไม่เคยส่งและไม่เคยอ่าน reply) |
+| `TSH` / `TSL` | สั่ง D7 เป็น HIGH/LOW ค้างโดยไม่ผ่าน timer (debug บนโต๊ะ — แยกปัญหาสายกับปัญหาโค้ด timer) |
+| `TR?` | dump ค่า register ของ Timer4 จริงจากชิป (debug บนโต๊ะ) |
+
+### ALPIDE trigger (J1)
+
+D7 เป็น **OC4B** = ขา hardware PWM ของ Timer4 ช่อง B ดังนั้นพัลส์ถูกสร้างโดยตัว timer เอง ไม่ได้สร้างใน `loop()` — ความถี่จึงนิ่งเป๊ะไม่ว่า serial จะยุ่งแค่ไหน ครอบคลุม 1 Hz – 95 kHz (ปรับ prescaler อัตโนมัติ) ใช้แทน trigger ที่ปกติกล่อง FPGA ของ KCMH ส่งผ่าน LEMO เมื่อกล่องนั้นเป็นตัวที่เสียบ DB9 อยู่
+
+> ⚠️ **ถ้าจะแก้โค้ด `trigApply()`: ต้องตั้งโหมด Fast PWM ให้เสร็จก่อนแล้วค่อยเขียน `OCR4B`** — `OCR4B` มี double buffer เฉพาะในโหมด PWM ส่วนโหมด CTC/Normal ไม่มี ถ้าเขียนตอนที่ timer ยังอยู่ใน CTC (เช่น หลังสั่ง `TCCR4B = 0` เพื่อหยุด timer) ค่าจะลงแค่ compare register แล้วบัฟเฟอร์ที่ยังไม่ถูกเซ็ตจะทับทิ้งตอน BOTTOM รอบแรก อาการคือ `OCR4B` เหลือแค่ไบต์ล่าง (เคยเจอ: ตั้ง 31249 แล้วได้ 17 = `0x11` → duty เหลือ 0.03% วัดแล้วเหมือนไม่มีสัญญาณเลย) ใช้ `TR?` อ่านค่าจริงจากชิปเทียบทุกครั้งที่แก้
+>
+> ⚠️ **D6 (Relay B) กับ D7 อยู่บน Timer4 ตัวเดียวกัน** (D6 = OC4A, D7 = OC4B) โค้ดต่อ output เฉพาะช่อง B เท่านั้น (COM4A/COM4C เป็น 0 เสมอ) D6 จึงยังเป็น GPIO ปกติที่ `digitalWrite()` คุมได้ — **ห้ามใช้ `analogWrite()` กับ D6/D7/D8** และ **ห้าม `digitalWrite(D7)` ขณะ trigger ทำงาน** เพราะ `digitalWrite` ของ Arduino จะเคลียร์ COM4B1 ทำให้ trigger ดับเงียบๆ
 
 ### DB9 wiring (TSS interlock)
 

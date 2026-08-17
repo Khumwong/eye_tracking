@@ -32,7 +32,8 @@ eye_tracking/
 ├── main.py              ← จุดเริ่มต้น
 ├── app.py               ← UI และการเชื่อมต่อ component
 ├── capture.py           ← การจับภาพ / ตรวจจับดวงตา / บันทึกวิดีโอ
-├── arduino.py           ← การสื่อสารกับ Arduino
+├── arduino.py           ← การสื่อสารกับ Arduino (เขียนคำสั่ง + อ่าน reply)
+├── alpide_daq.py        ← คุม ALPIDE/EUDAQ2 acquisition
 ├── test_relay.py        ← bench test: วนทุก state อัตโนมัติ (ฟังเสียง relay)
 ├── test_relay_hold.py   ← bench test: ค้าง state ไว้จนกด Enter (ใช้ตอนวัด multimeter)
 └── video/               ← ไฟล์วิดีโอที่บันทึก
@@ -79,6 +80,51 @@ eye_tracking/
 - `send(msg)`: ส่งคำสั่งผ่าน serial พร้อม lock
 - คำสั่งที่ใช้: `B1\n`/`B0\n` = เปิด/ปิด beam, `E1\n`/`E0\n` = เปิด/ปิด Enable (ส่งตอนกด READY/UNREADY)
 - Arduino ส่ง `READY\n` ตอน boot เพื่อยืนยัน connection (ป้องกัน false positive จาก device อื่น)
+
+---
+
+## ALPIDE acquisition (วัด latency ของการ gate)
+
+**จุดประสงค์:** ยืนยันว่าตอนตาอยู่ตำแหน่งถูกมีโปรตอนออกมาจริง และตอนตาหลุด **บีมหยุดจริงที่เวลาเท่าไหร่**
+
+### ทำไม trigger ต้องวิ่งต่อเนื่อง ห้าม gate ตามบีม
+
+ถ้า trigger ดับตามบีม จะไม่มี readout ระหว่างบีมดับ → **"ไม่มีโปรตอน" กับ "ไม่ได้อ่านค่า" แยกกันไม่ออก** ซึ่งเป็นการเปรียบเทียบที่การวัดทั้งหมดตั้งอยู่บนนั้น เพราะงั้น trigger วิ่งคงที่ตลอดขณะ armed
+
+### นาฬิกากลาง: จำนวนพัลส์ trigger
+
+Arduino รู้ทั้งสองอย่าง — รับคำสั่ง `B1`/`B0` **และ** เป็นตัวสร้างพัลส์ trigger เอง เพราะงั้นตอนบีมเปลี่ยนสถานะจริง มันจะพิมพ์ `EV B1 <pulses>` / `EV B0 <pulses>` กลับมา (นับจาก `T1`) แล้วแอปบันทึกลง `alpide_output/session_*/beam_events.csv`
+
+**pulse count = ALPIDE event index** (ตราบใดที่ไม่มี event หลุด) → หา event ที่โปรตอนหยุดในไฟล์ `.raw` เทียบกับเลขพัลส์ตอน `B0` = ได้ latency **โดยไม่ต้องเทียบนาฬิกาสองระบบเลย**
+
+> ⚠️ ความถูกต้องขึ้นกับการที่ **ไม่มี event หลุด** — ที่ 9500 Hz ต่อเนื่อง plane ทั้ง 6 หลุด sync ภายใน ~1 วินาที (`Warning! Out of sync!`) ทำให้ pulse count กับ event index ไม่ตรงกันอีก ค่า default จึงเป็น **1000 Hz** (ความละเอียด 1 ms ซึ่งละเอียดกว่า latency ระดับหลายสิบ ms ที่จะวัดอยู่มาก) — ยังไม่ได้ทดสอบว่าเพดานที่ปลอดภัยจริงคือเท่าไหร่
+>
+> **host timestamp ใน CSV เชื่อได้แค่หยาบๆ** — วัดแล้วพบ jitter หลายร้อย ms จาก Tk scheduling + โหลด MediaPipe ใช้ pulse count เป็นหลักเสมอ
+
+### ขั้นตอนอัตโนมัติ
+
+| กด | ทำอะไร |
+|---|---|
+| **READY** | `E1` + flash FX3 firmware ถ้าบอร์ดอยู่ใน DFU mode |
+| **START** | ตั้งความถี่ + `T1` → launch EUDAQ2 (background) → arm ทันทีไม่รอ |
+| **STOP** | `B0` → `T0` → หยุด EUDAQ2 + ปิด CSV |
+
+**START ไม่รอให้ EUDAQ2 ขึ้นก่อน arm** — EUDAQ2 ใช้เวลา ~10 วินาทีจึงพร้อม การหน่วงบีมไว้นานเท่านั้นแย่กว่าการเสียข้อมูลช่วงต้นไม่กี่วินาที และ transition ที่จะวัดเกิดซ้ำตลอด run อยู่แล้ว
+
+**ทุกอย่างในส่วน ALPIDE เป็น best-effort** — ถ้าบอร์ดไม่อยู่/flash ไม่ผ่าน/EUDAQ2 พัง จะขึ้นข้อความในบรรทัดสถานะเท่านั้น **ไม่ขวาง READY/START/STOP หรือการ gate บีมเลย**
+
+### กับดักที่เจอมาแล้ว (สำคัญ)
+
+1. **EUDAQ2 รันใน venv ของ eye_tracking ไม่ได้** — สคริปต์ใช้ `#!/usr/bin/env python3` และต้องการ `urwid` + `alpidedaqboard` (editable install) จาก user site-packages ซึ่ง venv ไม่มี `alpide_daq.clean_env()` ถอด `VIRTUAL_ENV`/`PATH` ของ venv ออกก่อน spawn ทุกครั้ง
+   **แย่กว่านั้น: tmux pane สืบทอด env จาก tmux server ตัวที่เริ่มไว้ก่อน** เพราะงั้นถ้า launch ครั้งแรกด้วย env ที่ปนเปื้อน มันจะพังซ้ำๆ จนกว่าจะ `tmux kill-server`
+2. **FX3 firmware อยู่ใน RAM** บอร์ดกลับเป็น DFU mode ทุกครั้งที่ไฟหลุดหรือ run ถูกตัดกลางคัน — ต้อง flash ทุก session (แอปทำให้อัตโนมัติตอน READY)
+3. **tmux session ชื่อ `ITS3` กับบอร์ด 6 ตัวเป็นทรัพยากรร่วมกับ KCMH-Tricker** — แอปเช็ค `session_active()` แล้วข้ามการ launch ถ้ามี session อยู่แล้ว **ห้ามรัน acquisition สองแอปพร้อมกัน**
+
+### ค่าที่ตั้งใน `config.py`
+
+`ALPIDE_NUM`, `ALPIDE_EVENTS`, `ALPIDE_STROBE`, `ALPIDE_ITHR`, `TRIGGER_HZ`, `TRIGGER_DUTY`, `KCMH_TRICKER_DIR`, `EUDAQ_DIR` — อยู่ในไฟล์ไม่ใช่ UI เพราะเปลี่ยนตาม campaign ไม่ใช่ตาม session (มีแค่ความถี่ trigger ที่โผล่มาใน UI เพราะต้องปรับหน้างาน)
+
+`alpide_daq.py` **import โมดูลของ Kcmh-Tricker ตรงๆ ไม่ copy** — logic การ generate config ที่นั่นมีค่าคงที่ของฮาร์ดแวร์จริง (serial ของ DAQ 6 ตัว, ตาราง VCASN/VCASN2, `EUDAQ_FW_PATTERN`) ถ้า copy มาจะ drift จากกันเงียบๆ
 
 ---
 

@@ -24,6 +24,11 @@
 // Commands: B1\n = Beam ON,    B0\n = Beam OFF
 //           E1\n = Enable ON,  E0\n = Enable OFF
 //           H\n  = heartbeat (refreshes the relay watchdog, changes nothing)
+//
+// Replies: the board prints "EV B1 <n>" / "EV B0 <n>" whenever the beam state
+//          actually changes, where <n> is the trigger pulse count since T1.
+//          That count is the shared clock with the ALPIDE data — see
+//          trig_pulses below. Periodic B1/B0 refreshes are not echoed.
 //           T1\n = Trigger ON, T0\n = Trigger OFF
 //           TF<hz>\n   set trigger frequency, 1..95000 Hz   (e.g. TF9500)
 //           TD<pct>\n  set trigger duty cycle, 1..99 %      (e.g. TD50)
@@ -61,6 +66,25 @@ bool          trig_on   = false;
 
 bool          enable_on = false;
 bool          beam_on   = false;
+
+// Trigger pulse counter — the shared clock between this board and the ALPIDE
+// data. Timer4 overflows once per PWM period in mode 14, so the count is the
+// number of readout pulses emitted since T1, which (as long as no events are
+// dropped) is the same index as the ALPIDE event number. Reporting the count at
+// each beam transition is what lets "eye left the target" be located in the
+// detector data without having to align two clocks.
+volatile unsigned long trig_pulses = 0;
+
+ISR(TIMER4_OVF_vect) { trig_pulses++; }
+
+unsigned long pulseCount() {
+  unsigned long v;
+  uint8_t sreg = SREG;
+  cli();
+  v = trig_pulses;
+  SREG = sreg;
+  return v;
+}
 unsigned long last_cmd_ms = 0;
 bool          wd_tripped  = false;
 
@@ -103,10 +127,17 @@ void trigApply() {
 
 void trigStart() {
   trigApply();
+  uint8_t sreg = SREG;
+  cli();
+  trig_pulses = 0;           // count from the start of this run
+  SREG = sreg;
+  TIFR4  = (1 << TOV4);      // clear a pending overflow before enabling
+  TIMSK4 |= (1 << TOIE4);
   TCCR4A |= (1 << COM4B1);   // connect OC4B to D7
 }
 
 void trigStop() {
+  TIMSK4 &= ~(1 << TOIE4);
   TCCR4A &= ~(1 << COM4B1);  // release D7 back to the port register
   digitalWrite(TRIG_PIN, LOW);
 }
@@ -132,6 +163,7 @@ void loop() {
       (millis() - last_cmd_ms) > WATCHDOG_MS) {
     digitalWrite(RELAY_B, LOW);        // beam first, then enable
     digitalWrite(RELAY_A, LOW);
+    if (beam_on) { Serial.print("EV B0 "); Serial.println(pulseCount()); }
     beam_on   = false;
     enable_on = false;
     wd_tripped = true;
@@ -148,9 +180,11 @@ void loop() {
       }
       if (input == "B1") {
         digitalWrite(RELAY_B, HIGH);
+        if (!beam_on) { Serial.print("EV B1 "); Serial.println(pulseCount()); }
         beam_on = true;
       } else if (input == "B0") {
         digitalWrite(RELAY_B, LOW);
+        if (beam_on) { Serial.print("EV B0 "); Serial.println(pulseCount()); }
         beam_on = false;
       } else if (input == "E1") {
         digitalWrite(RELAY_A, HIGH);

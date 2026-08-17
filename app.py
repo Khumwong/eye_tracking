@@ -6,9 +6,11 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from datetime import datetime
 
 from PIL import Image, ImageTk
 
+import alpide_daq
 from arduino import ArduinoController
 from capture import CaptureThread
 from config import (
@@ -38,9 +40,17 @@ class EyeTrackingApp:
         self.pause_event = threading.Event()
         self.pause_event.set()
 
-        self.arduino = ArduinoController()
+        self.arduino = ArduinoController(on_line=self._on_arduino_line)
         self.ready = False
         self._cam_ok = False
+
+        # ALPIDE acquisition (best-effort throughout — see alpide_daq docstring)
+        self._alpide_pid     = None
+        self._alpide_dir     = ''
+        self._alpide_busy    = False   # a firmware flash is running
+        self._alpide_msg     = 'idle'
+        self._ev_log         = None    # open CSV correlating beam <-> pulses
+        self.trigger_hz      = tk.IntVar(value=config.TRIGGER_HZ)
 
         self.eye_side       = tk.StringVar(value='left')
         self.center_x       = tk.IntVar(value=config.DEFAULT_CENTER[0])
@@ -82,6 +92,7 @@ class EyeTrackingApp:
         self._wire_params()
         self._build_ui()
         self.root.after(100, self._connect_arduino)
+        self.root.after(1500, self._alpide_status_tick)
         self.root.after(200, self._maybe_start_preview)
 
     # ── Param sync ─────────────────────────────────
@@ -412,6 +423,33 @@ class EyeTrackingApp:
                                  font=('Helvetica', 9))
             rb.pack(side=tk.LEFT, padx=(0, 16))
             self._eye_radios.append(rb)
+
+        self._divider(inner)
+
+        # ── ALPIDE acquisition ─────────────────────
+        # Deliberately just a status line and the trigger rate: the EUDAQ
+        # parameters live in config.py because they change per campaign, not per
+        # session, and having them on screen invites fiddling mid-treatment.
+        self._section_header(inner, "ALPIDE ACQUISITION")
+        arow = tk.Frame(inner, bg=PANEL)
+        arow.pack(fill=tk.X, padx=12, pady=(0, 2))
+        tk.Label(arow, text="Detector", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        self._alpide_lbl = tk.Label(arow, text="—", bg=PANEL, fg=MUTED,
+                                     font=('Courier', 8))
+        self._alpide_lbl.pack(side=tk.RIGHT)
+
+        trow2 = tk.Frame(inner, bg=PANEL)
+        trow2.pack(fill=tk.X, padx=12, pady=(2, 2))
+        tk.Label(trow2, text="Trigger", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        self._trig_entry = tk.Entry(trow2, textvariable=self.trigger_hz, width=7,
+                                     bg=INSET, fg=TEXT, insertbackground=TEXT,
+                                     relief='flat', justify='right',
+                                     font=('Courier', 9))
+        self._trig_entry.pack(side=tk.RIGHT)
+        tk.Label(trow2, text="Hz", bg=PANEL, fg=MUTED,
+                 font=('Helvetica', 8)).pack(side=tk.RIGHT, padx=(0, 4))
 
         self._divider(inner)
 
@@ -867,6 +905,7 @@ class EyeTrackingApp:
                 return
             self.ready = True
             self.arduino.send(b'E1\n')
+            self._alpide_prepare()      # flash FX3 images if boards are in DFU
             self.ready_btn.config(text="●   UNREADY", bg=GREENB, fg=GREENL,
                                   activebackground=GREENB, activeforeground=GREENL)
             self.start_btn.config(bg=CYAN, fg=CYAND,
@@ -1039,6 +1078,7 @@ class EyeTrackingApp:
         self._fm_tab.config(state=state)
         self._fp_tab.config(state=state)
         self._threshold_scale.config(state=state)
+        self._trig_entry.config(state=state)
         if self.debug:
             self._cam_tab.config(state=state)
             self._vid_tab.config(state=state)
@@ -1048,6 +1088,8 @@ class EyeTrackingApp:
             messagebox.showerror("Not ready", "กรุณากด READY ก่อนเริ่ม tracking")
             return
         self._set_config_locked(True)
+        self._trigger_on()
+        self._alpide_start()
         if self.capture and self.capture.running:
             # preview is already live (camera mode) — just arm the beam relay
             self.capture.armed = True
@@ -1064,6 +1106,8 @@ class EyeTrackingApp:
         self.arduino.send(b'B0\n')
         self._beam_off()
         self._set_config_locked(False)
+        self.arduino.send(b'T0\n')
+        self._alpide_stop()
         if self.capture:
             self.capture.armed = False
 
@@ -1120,6 +1164,174 @@ class EyeTrackingApp:
         self._tick_heartbeat()
         self.root.after(30, self._update_frame)
 
+    # ── Trigger ────────────────────────────────────
+    # Runs continuously while armed and is never gated with the beam: if the
+    # trigger stopped when the beam did there would be no readout during beam-off
+    # and "no protons" would be indistinguishable from "not looking", which is
+    # exactly the comparison the measurement rests on.
+
+    def _trigger_on(self):
+        try:
+            hz = int(self.trigger_hz.get())
+        except (tk.TclError, ValueError):
+            hz = config.TRIGGER_HZ
+        hz = max(1, min(95000, hz))
+        self.trigger_hz.set(hz)
+        self.arduino.send(f'TF{hz}\n'.encode())
+        self.arduino.send(f'TD{config.TRIGGER_DUTY}\n'.encode())
+        self.arduino.send(b'T1\n')
+
+    # ── ALPIDE acquisition ─────────────────────────
+    # Every entry point here is best-effort: ALPIDE recording is additive to
+    # eye_tracking's job, so nothing in this section may block or delay READY,
+    # START or STOP. Failures land in the status line, not in a modal.
+
+    def _alpide_status_tick(self):
+        """Poll board presence off the UI thread (lsusb shells out)."""
+        def _work():
+            try:
+                state, msg = alpide_daq.status()
+            except Exception as e:
+                state, msg = 'missing', f'{type(e).__name__}'
+            self.root.after(0, lambda: self._alpide_show(state, msg))
+        if not self._alpide_busy:
+            threading.Thread(target=_work, daemon=True).start()
+        self.root.after(2000, self._alpide_status_tick)
+
+    def _alpide_show(self, state=None, msg=None):
+        if state is not None:
+            self._alpide_state, self._alpide_board_msg = state, msg
+        state = getattr(self, '_alpide_state', 'missing')
+        msg = getattr(self, '_alpide_board_msg', '—')
+        colour = {'ready': GREENL, 'unprogrammed': AMBERL,
+                  'partial': AMBERL, 'missing': MUTED}.get(state, MUTED)
+        run = f'  ·  {self._alpide_msg}' if self._alpide_msg else ''
+        self._alpide_lbl.config(text=f'{msg}{run}', fg=colour)
+
+    def _alpide_note(self, msg):
+        """Called from worker threads, so the label refresh is marshalled back to
+        the UI thread — the status poll is paused during a firmware flash, which
+        is exactly when progress matters most."""
+        self._alpide_msg = msg
+        print(f'[ALPIDE] {msg}')
+        try:
+            self.root.after(0, self._alpide_show)
+        except Exception:
+            pass
+
+    def _alpide_prepare(self):
+        """Flash the FX3 images if the boards are sitting in DFU mode. The image
+        lives in RAM, so this is a normal per-session step rather than recovery
+        — boards fall back to DFU whenever they lose power or a run is killed."""
+        if self._alpide_busy:
+            return
+        try:
+            state, _ = alpide_daq.status()
+        except Exception:
+            return
+        if state != 'unprogrammed':
+            return
+        self._alpide_busy = True
+        self._alpide_note('flashing firmware…')
+
+        def _done(ok):
+            self._alpide_busy = False
+            self._alpide_note('firmware installed' if ok
+                              else 'firmware install FAILED')
+
+        threading.Thread(
+            target=lambda: alpide_daq.install_firmware(on_done=_done),
+            daemon=True).start()
+
+    def _alpide_start(self):
+        """Launch acquisition in the background and arm regardless of how it
+        goes. Waiting for EUDAQ2 to come up takes ~10 s; holding the beam back
+        that long would be worse than losing the first few seconds of detector
+        data, and the transitions being measured repeat throughout the run."""
+        if self._alpide_pid is not None:
+            return
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        self._alpide_dir = os.path.join(os.path.dirname(__file__),
+                                        'alpide_output', f'session_{ts}')
+        self._open_ev_log(self._alpide_dir)
+
+        def _work():
+            try:
+                if alpide_daq.session_active():
+                    # shared machine-wide resources: the ITS3 tmux session and
+                    # the six boards. Racing a session that KCMH-Tricker (or a
+                    # crashed run) still owns would corrupt both.
+                    self._alpide_note('ITS3 session already running — skipped')
+                    return
+                state, msg = alpide_daq.status()
+                if state != 'ready':
+                    self._alpide_note(f'not recording ({msg})')
+                    return
+                pid = alpide_daq.start_run(self._alpide_dir)
+                self._alpide_pid = pid
+                self._alpide_note('acquisition starting…')
+                ok = alpide_daq.wait_for_data(self._alpide_dir)
+                self._alpide_note('recording' if ok else 'no data — check rc.log')
+            except Exception as e:
+                self._alpide_note(f'start failed: {type(e).__name__}: {e}')
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _alpide_stop(self):
+        pid, self._alpide_pid = self._alpide_pid, None
+        self._close_ev_log()
+        if pid is None:
+            return
+        self._alpide_note('stopping acquisition…')
+
+        def _work():
+            alpide_daq.stop_run(pid)
+            self._alpide_note('stopped')
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── Beam/pulse correlation log ─────────────────
+    # The board reports the trigger pulse count at each beam transition, and the
+    # pulse count is the same index as the ALPIDE event number while nothing is
+    # dropped. This CSV is therefore what turns the .raw file into a latency
+    # measurement: it says which event number the beam was cut at.
+
+    def _open_ev_log(self, folder):
+        self._close_ev_log()
+        try:
+            os.makedirs(folder, exist_ok=True)
+            self._ev_log = open(os.path.join(folder, 'beam_events.csv'), 'w')
+            self._ev_log.write('host_time_iso,host_monotonic,event,pulse\n')
+            self._ev_log.flush()
+        except Exception:
+            self._ev_log = None
+
+    def _close_ev_log(self):
+        if self._ev_log:
+            try:
+                self._ev_log.close()
+            except Exception:
+                pass
+        self._ev_log = None
+
+    def _on_arduino_line(self, line):
+        """Called from the serial reader thread — keep it short and non-blocking."""
+        if not line.startswith('EV '):
+            print(f'[Arduino] {line}')
+            return
+        parts = line.split()
+        if len(parts) != 3:
+            return
+        _, ev, pulse = parts
+        if self._ev_log:
+            try:
+                self._ev_log.write(
+                    f'{datetime.now().isoformat()},{time.monotonic():.6f},'
+                    f'{ev},{pulse}\n')
+                self._ev_log.flush()
+            except Exception:
+                pass
+
     # ── Watchdog heartbeat ─────────────────────────
     # The Arduino drops both relays if it hears nothing for WATCHDOG_MS (see
     # eye_tracking_beam.ino), so a crashed or hung app can no longer leave
@@ -1151,7 +1363,9 @@ class EyeTrackingApp:
 
     def on_close(self):
         self.arduino.send(b'B0\n')
+        self.arduino.send(b'T0\n')
         self.arduino.send(b'E0\n')
+        self._alpide_stop()
         if self.capture:
             self.capture.armed = False
         self._teardown_capture()

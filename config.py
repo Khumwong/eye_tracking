@@ -17,6 +17,24 @@ DEFAULT_THRESHOLD_MM = 3.0
 TARGET_MARK_PX   = 8   # half-length of the fixed crosshair at the target point
 DETECTED_MARK_PX = 3   # radius of the dot marking the measured eye position
 
+# ── ALPIDE / EUDAQ2 acquisition ──────────────────────
+# Kept here rather than in the UI: these change per experiment campaign, not per
+# session, and putting them on screen invites fiddling mid-treatment.
+KCMH_TRICKER_DIR = '/home/kobdaj/Kcmh-Tricker'   # owns EUDAQ2 config gen + firmware images
+EUDAQ_DIR        = '/home/kobdaj/eudaq2/user/ITS3/misc/'
+ALPIDE_NUM       = 6
+ALPIDE_EVENTS    = 500000   # RunControl stops the run at this many events
+ALPIDE_STROBE    = 100
+ALPIDE_ITHR      = 60
+
+# Readout clock on D7 -> J1. 1 kHz gives 1 ms timing resolution, which is well
+# under the tens of ms of gating latency being measured, and sustains far longer
+# than 9500 Hz — where the six planes desync within about a second because the
+# readout cannot keep up. The latency measurement relies on ALPIDE event index
+# matching the trigger pulse count, which only holds while nothing is dropped.
+TRIGGER_HZ   = 1000
+TRIGGER_DUTY = 50
+
 # ── Arduino ──────────────────────────────────────────
 ARDUINO_BAUD = 9600
 ARDUINO_VID  = 0x1A86   # CH340

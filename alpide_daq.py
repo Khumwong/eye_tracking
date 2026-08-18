@@ -252,24 +252,56 @@ def raw_files(outpath):
         return []
 
 
+_ANSI_RE  = re.compile(r'\x1b\[[0-9;]*m')
+_PLANE_RE = re.compile(r'ALPIDE_plane_(\d+)\s+(\S+)')
+
+
+def pane_text(pane='rc', lines=None, session=None):
+    """Text of a tmux pane with ANSI escapes stripped, or '' if unavailable.
+
+    RunControl exposes its state nowhere but its TUI, so scraping the pane is
+    the only way to see what the six planes are doing. Never raises: every
+    caller here is best-effort and a missing tmux session is an ordinary state,
+    not an error.
+    """
+    target = f'{session or TMUX_SESSION}:{pane}'
+    cmd = ['tmux', 'capture-pane', '-p']
+    if lines:
+        cmd += ['-S', f'-{int(lines)}']
+    cmd += ['-t', target]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=5).stdout
+    except Exception:
+        return ''
+    return _ANSI_RE.sub('', out)
+
+
+def plane_states(text):
+    """{plane_number: state} parsed from RunControl's connection table.
+
+    A later line wins: the pane holds scrollback, so the same plane appears once
+    per redraw and only the most recent one describes the present.
+
+    Strips ANSI itself rather than trusting the caller to have done it. With
+    escapes left in, the state reads as '\\x1b[32mRUNNING\\x1b[0m' — which never
+    equals 'RUNNING', so a run that was up would look like one that never
+    started, with nothing on screen to suggest why.
+    """
+    return {int(n): state
+            for n, state in _PLANE_RE.findall(_ANSI_RE.sub('', text or ''))}
+
+
 def wait_for_running(timeout=40.0):
     """True once RunControl reports the producers RUNNING.
 
     Used in place of waiting for the .raw to grow, because the trigger is
     deliberately not started until the run is up — and with no trigger there is
-    no data to wait for. Scraping the TUI is crude, but RunControl exposes its
-    state nowhere else.
+    no data to wait for.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            out = subprocess.run(['tmux', 'capture-pane', '-p', '-t',
-                                  f'{TMUX_SESSION}:rc'],
-                                 capture_output=True, text=True, timeout=5).stdout
-        except Exception:
-            out = ''
-        out = re.sub(r'\x1b\[[0-9;]*m', '', out)
-        if re.search(r'ALPIDE_plane_\d\s+RUNNING', out):
+        if 'RUNNING' in plane_states(pane_text()).values():
             return True
         time.sleep(1.0)
     return False

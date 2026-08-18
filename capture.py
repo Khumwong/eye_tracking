@@ -45,6 +45,17 @@ class CaptureThread:
         # directly (same pattern as debug_enabled below), no lock needed.
         self.armed = armed
 
+        # Operator override: while latched, the beam stays off no matter what
+        # the eye is doing. Same ownership rule as `armed` — main thread writes,
+        # this thread reads, no lock. Mirrors Kcmh-Tricker's Kill beam toggle,
+        # which is likewise a state the run cannot overrule rather than a
+        # one-shot command.
+        self.kill_latched = False
+        # When the beam was last closed, for the minimum-off hold in
+        # _gate_open. None means "not since this thread started", so the first
+        # open of a run is never delayed.
+        self._beam_off_since = None
+
         self.running = False
         self.current_state = 'S'
         self._seek = -1
@@ -84,6 +95,15 @@ class CaptureThread:
         self._rec_frame_idx = 0
         self._writer_lock = threading.Lock()
         self._thread = None
+
+        # One snapshot per beam-off transition, written by a separate thread.
+        # Encoding a 1080p JPEG costs 10-20 ms and this loop's period *is* the
+        # beam's reaction time, so the detection loop only ever hands the frame
+        # over — see _cut_writer.
+        self._cut_queue   = None
+        self._cut_thread  = None
+        self._cut_dropped = 0
+        self._cut_saved   = 0
 
     # ── Public API (main thread only) ─────────────────────────
 
@@ -128,6 +148,120 @@ class CaptureThread:
                 self._ts_file = None
             self._rec_frame_idx = 0
             self._recording = True
+
+    def start_cut_capture(self, folder):
+        """Save the screen at every beam-off transition into `folder`.
+
+        Tied to arming rather than to the RECORD button on purpose: five of the
+        first eight sessions recorded no video at all because nobody pressed it,
+        and those are exactly the runs where a beam cut left no picture of what
+        the eye was doing.
+        """
+        self.stop_cut_capture()
+        self._cut_dropped = 0
+        self._cut_saved = 0
+        self._cut_queue = queue.Queue(maxsize=config.CUT_QUEUE_MAX)
+        self._cut_thread = threading.Thread(
+            target=self._cut_writer, args=(folder, self._cut_queue), daemon=True)
+        self._cut_thread.start()
+
+    def stop_cut_capture(self):
+        q, self._cut_queue = self._cut_queue, None
+        if q is not None:
+            q.put(None)                      # sentinel: flush and close the CSV
+        t, self._cut_thread = self._cut_thread, None
+        if t is not None:
+            t.join(timeout=3.0)
+
+    def _queue_cut(self, frame, trigger):
+        """Hand one frame to the writer. Called from the detection loop, so it
+        must never block: a full queue drops the frame instead of stalling the
+        decision that turns the beam off.
+
+        The frame is passed by reference, not copied. `_compose_display` builds
+        a fresh array every iteration and the two consumers downstream only read
+        it — the video writer works from `raw`, and the UI resizes into a new
+        array. Copying it here measured 4.4 ms of the detection loop's budget
+        for no benefit; if anything downstream ever starts drawing into the
+        displayed frame, this needs a copy again.
+        """
+        q = self._cut_queue
+        if q is None:
+            return
+        if self._last_deviation_mm is None:
+            reason = 'no_face' if trigger is None else 'blink'
+        else:
+            reason = 'no_face' if trigger is None else 'deviation'
+        meta = {
+            'iso':       datetime.now().isoformat(),
+            'monotonic': time.monotonic(),
+            'deviation': self._last_deviation_mm,
+            'threshold': self.params.get('threshold_mm', config.DEFAULT_THRESHOLD_MM),
+            'reason':    reason,
+        }
+        try:
+            q.put_nowait((frame, meta))
+        except queue.Full:
+            self._cut_dropped += 1
+
+    def _cut_writer(self, folder, q):
+        """Encode and index the snapshots, off the detection loop."""
+        index = csv_file = writer = None
+        try:
+            os.makedirs(folder, exist_ok=True)
+            csv_file = open(os.path.join(folder, 'cuts.csv'), 'w', newline='')
+            writer = csv.writer(csv_file)
+            # host_monotonic is the same clock as beam_events.csv and the video
+            # frame log, so a snapshot joins straight onto the trigger pulse
+            # count and from there onto the ALPIDE data.
+            writer.writerow(['index', 'host_time_iso', 'host_monotonic',
+                             'deviation_mm', 'threshold_mm', 'reason', 'file'])
+            csv_file.flush()
+            index = 0
+        except Exception:
+            csv_file = None
+
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            if csv_file is None or index >= config.CUT_MAX_PER_SESSION:
+                continue
+            frame, meta = item
+            index += 1
+            name = f'cut_{index:04d}.jpg'
+            try:
+                cv2.imwrite(os.path.join(folder, name), frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, config.CUT_JPEG_QUALITY])
+                writer.writerow([
+                    index, meta['iso'], f"{meta['monotonic']:.6f}",
+                    '' if meta['deviation'] is None else f"{meta['deviation']:.4f}",
+                    f"{meta['threshold']:.2f}", meta['reason'], name])
+                csv_file.flush()
+                self._cut_saved = index
+            except Exception:
+                pass
+            if index >= config.CUT_MAX_PER_SESSION:
+                # Say so in the file itself: a truncated set of snapshots that
+                # does not admit it is worse than none.
+                try:
+                    writer.writerow(['', '', '', '', '', 'limit_reached',
+                                     f'stopped after {index} snapshots'])
+                    csv_file.flush()
+                except Exception:
+                    pass
+
+        if csv_file is not None:
+            if self._cut_dropped:
+                try:
+                    writer.writerow(['', '', '', '', '', 'dropped',
+                                     f'{self._cut_dropped} frame(s) not written'])
+                except Exception:
+                    pass
+            try:
+                csv_file.close()
+            except Exception:
+                pass
 
     def stop_recording(self):
         self._recording = False
@@ -223,13 +357,19 @@ class CaptureThread:
 
                 frame, view_meta = self._compose_display(frame, gray_bgr, center, trigger)
 
-                armed_trigger = trigger and self.armed
+                armed_trigger = self._gate_open(trigger)
                 if armed_trigger and self.current_state != 'O':
                     self.arduino.send(b'B1\n')
                     self.current_state = 'O'
                 elif not armed_trigger and self.current_state != 'S':
                     self.arduino.send(b'B0\n')
                     self.current_state = 'S'
+                    self._beam_off_since = time.monotonic()
+                    # After the relay command, never before it: the snapshot is
+                    # evidence about the beam cut, not part of causing it. Only
+                    # on the transition — the periodic refresh below re-states a
+                    # decision that already happened.
+                    self._queue_cut(frame, trigger)
                 elif self._frame_idx % self._BEAM_REFRESH_N == 0:
                     # Re-state the unchanged decision periodically. On-change
                     # alone can go silent for minutes while the eye holds still,
@@ -433,6 +573,33 @@ class CaptureThread:
         return main, view_meta
 
     # ── Detection ─────────────────────────────────────────────
+
+    def _gate_open(self, trigger, now=None):
+        """Whether the beam may be on this frame — the whole beam decision.
+
+        Kept as one named method rather than an expression inside the loop so
+        that every condition the beam depends on is in one greppable place and
+        can be tested without a camera. `trigger` is the detection result: True
+        on target, False off target or blinking, None when no face was found.
+
+        The minimum-off hold is applied here and only here, and only to opening:
+        every path that closes the beam stays immediate. An eye resting exactly
+        on the threshold would otherwise chatter the shutter many times a
+        second, which leaves too little between transitions to time either one.
+
+        It is a trade, not a fix: holding longer buys fewer relay cycles at the
+        cost of beam duty cycle, measured at 92% with no hold down to 14% at a
+        5 s hold. The dose still has to reach the same MU either way, so a low
+        duty cycle is paid for in how long the patient is held in position. The
+        right value is a clinical judgement — see next.md.
+        """
+        if not (trigger and self.armed and not self.kill_latched):
+            return False
+        hold = self.params.get('min_off_s', config.DEFAULT_MIN_OFF_S)
+        if hold and self._beam_off_since is not None:
+            if (now or time.monotonic()) - self._beam_off_since < hold:
+                return False
+        return True
 
     def _within_threshold(self, ex, ey, ir, center):
         """Return (triggered, deviation_mm). Uses iris size to convert px → mm."""

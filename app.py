@@ -2,6 +2,7 @@ import cv2
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -19,11 +20,18 @@ from config import (
     BG, PANEL, CARD, INSET, BORD,
     CYAN, CYAND, CYANL, TEXT, TEXT2, MUTED,
     GREENB, GREENL, REDB, REDL, AMBERB, AMBERL,
+    MUTEDT, GREEN_TXT, RED_TXT, AMBER_TXT, FEED_BG, HDR_SUB,
 )
 import config
 
 
 class EyeTrackingApp:
+    # Size of the ITS3 sheet, in characters. RunControl draws an 80-column,
+    # 39-line screen; the sheet is cut to that so it comes up showing the whole
+    # thing at once, with neither scrollbars nor empty margin.
+    _ITS3_COLS  = 80
+    _ITS3_LINES = 40
+
     def __init__(self, root, debug=False):
         self.root = root
         self.root.title("Eye Tracking Beam Control")
@@ -54,6 +62,10 @@ class EyeTrackingApp:
         self._alpide_failed  = 'not started'   # None once recording is confirmed
         self._ev_log         = None    # open CSV correlating beam <-> pulses
         self._session_root   = ''      # output/session_<ts> for this run
+        self._daq_ready      = False   # EUDAQ2 is up and RUNNING, trigger not yet started
+        self._launch_state   = 'locked'
+        self._pending_start_hz = None  # START pressed while LAUNCH was still coming up
+        self._killed         = False   # operator override: beam forced off
         self.trigger_hz      = tk.IntVar(value=config.TRIGGER_HZ)
 
         self.eye_side       = tk.StringVar(value='left')
@@ -61,6 +73,7 @@ class EyeTrackingApp:
         self.center_y       = tk.IntVar(value=config.DEFAULT_CENTER[1])
         self.detect_method  = tk.StringVar(value='facemesh')
         self.threshold_mm   = tk.DoubleVar(value=config.DEFAULT_THRESHOLD_MM)
+        self.min_off_s      = tk.DoubleVar(value=config.DEFAULT_MIN_OFF_S)
         self.input_mode     = tk.StringVar(value='camera')
         self.video_path     = tk.StringVar(value='')
         self.video_loop     = tk.BooleanVar(value=True)
@@ -91,12 +104,15 @@ class EyeTrackingApp:
             'cx': config.DEFAULT_CENTER[0], 'cy': config.DEFAULT_CENTER[1],
             'side': 'left', 'speed': 1.0, 'loop': True,
             'detect_method': 'facemesh', 'threshold_mm': config.DEFAULT_THRESHOLD_MM,
+            'min_off_s': config.DEFAULT_MIN_OFF_S,
             'main_view': 'wide',
         }
         self._wire_params()
         self._build_ui()
+        self._refresh_flow()       # one source of truth for the FLOW colours
         self.root.after(100, self._connect_arduino)
         self.root.after(1500, self._alpide_status_tick)
+        self.root.after(1800, self._its3_tick)
         self.root.after(200, self._maybe_start_preview)
 
     # ── Param sync ─────────────────────────────────
@@ -108,6 +124,7 @@ class EyeTrackingApp:
         self.eye_side.trace_add(      'write', lambda *_: s('side',          self.eye_side))
         self.detect_method.trace_add( 'write', lambda *_: s('detect_method', self.detect_method))
         self.threshold_mm.trace_add(  'write', lambda *_: s('threshold_mm',  self.threshold_mm))
+        self.min_off_s.trace_add(     'write', lambda *_: self._sync_min_off())
         self.playback_speed.trace_add('write', lambda *_: s('speed',         self.playback_speed))
         self.video_loop.trace_add(    'write', lambda *_: s('loop',    self.video_loop))
 
@@ -165,18 +182,52 @@ class EyeTrackingApp:
         ov = c.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
         tk.Label(f, text=label, bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9)).pack(side=tk.LEFT)
-        self._lbl = tk.Label(f, text="—", bg=PANEL, fg=MUTED,
+        self._lbl = tk.Label(f, text="—", bg=PANEL, fg=MUTEDT,
                              font=('Helvetica', 9))
         self._lbl.pack(side=tk.RIGHT)
         return c, ov, self._lbl
 
     def _led_set(self, led_info, ok):
         c, ov, lbl = led_info
-        c.itemconfig(ov, fill=GREENL if ok else MUTED)
+        c.itemconfig(ov, fill=GREEN_TXT if ok else MUTED)
         lbl.config(text="Connected" if ok else "Offline",
-                   fg=GREENL if ok else MUTED)
+                   fg=GREEN_TXT if ok else MUTED)
 
     # ── UI helpers ─────────────────────────────────
+
+    # ── Sidebar scrolling ──────────────────────────
+
+    def _sidebar_fits(self):
+        """True when the whole sidebar is already visible."""
+        box = self._sidebar.bbox('all')
+        return not box or (box[3] - box[1]) <= self._sidebar.winfo_height()
+
+    def _sidebar_fit(self, canvas, sb, area):
+        """Keep the scrollregion current and hide the bar when nothing scrolls."""
+        canvas.configure(scrollregion=canvas.bbox('all'))
+        if self._sidebar_fits():
+            sb.pack_forget()
+            canvas.yview_moveto(0)      # nothing below, so do not sit part-way
+        else:
+            sb.pack(side=tk.RIGHT, fill=tk.Y, before=canvas)
+
+    def _sidebar_wheel(self, on):
+        for seq in ('<Button-4>', '<Button-5>', '<MouseWheel>'):
+            if on:
+                self._sidebar.bind_all(seq, self._sidebar_scroll)
+            else:
+                self._sidebar.unbind_all(seq)
+
+    def _sidebar_scroll(self, event):
+        if self._sidebar_fits():
+            return                      # refuse to move a column that fits
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        else:
+            step = -1 * (event.delta // 120)
+        self._sidebar.yview_scroll(step, 'units')
 
     def _section_header(self, parent, title):
         f = tk.Frame(parent, bg=PANEL, pady=0)
@@ -220,14 +271,14 @@ class EyeTrackingApp:
         sidebar.pack_propagate(False)
 
         # ── Header (fixed) ─────────────────────────
-        hdr = tk.Frame(sidebar, bg=CYAND, pady=0)
+        hdr = tk.Frame(sidebar, bg=CYANL, pady=0)
         hdr.pack(fill=tk.X)
         tk.Frame(hdr, bg=CYAN, height=3).pack(fill=tk.X)
-        body = tk.Frame(hdr, bg=CYAND, pady=12)
+        body = tk.Frame(hdr, bg=CYANL, pady=12)
         body.pack(fill=tk.X)
-        tk.Label(body, text="EYE TRACKING", bg=CYAND, fg='white',
+        tk.Label(body, text="EYE TRACKING", bg=CYANL, fg='white',
                  font=('Helvetica', 12, 'bold')).pack()
-        tk.Label(body, text="Beam Control System", bg=CYAND, fg=CYANL,
+        tk.Label(body, text="Beam Control System", bg=CYANL, fg=HDR_SUB,
                  font=('Helvetica', 8)).pack()
 
         # ── Status (fixed, always visible above the scroll area) ──
@@ -242,7 +293,7 @@ class EyeTrackingApp:
         ov1 = c1.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
         tk.Label(f1, text="Arduino", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
-        lbl1 = tk.Label(f1, text="Offline", bg=PANEL, fg=MUTED,
+        lbl1 = tk.Label(f1, text="Offline", bg=PANEL, fg=MUTEDT,
                         font=('Helvetica', 9))
         lbl1.pack(side=tk.RIGHT)
         self._ard_led = (c1, ov1, lbl1)
@@ -254,7 +305,7 @@ class EyeTrackingApp:
         ov2 = c2.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
         tk.Label(f2, text="Camera", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
-        lbl2 = tk.Label(f2, text="Offline", bg=PANEL, fg=MUTED,
+        lbl2 = tk.Label(f2, text="Offline", bg=PANEL, fg=MUTEDT,
                         font=('Helvetica', 9))
         lbl2.pack(side=tk.RIGHT)
         self._cam_led = (c2, ov2, lbl2)
@@ -267,14 +318,14 @@ class EyeTrackingApp:
         prow1.pack(fill=tk.X, pady=1)
         tk.Label(prow1, text="Iris size", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
-        self._iris_px_lbl = tk.Label(prow1, text="— px", bg=PANEL, fg=MUTED,
+        self._iris_px_lbl = tk.Label(prow1, text="— px", bg=PANEL, fg=MUTEDT,
                                       font=('Courier', 9, 'bold'))
         self._iris_px_lbl.pack(side=tk.RIGHT)
         prow1g = tk.Frame(st, bg=PANEL)
         prow1g.pack(fill=tk.X)
-        tk.Label(prow1g, text="  ↳ B/W", bg=PANEL, fg=MUTED,
+        tk.Label(prow1g, text="  ↳ B/W", bg=PANEL, fg=MUTEDT,
                  font=('Helvetica', 7), width=10, anchor='w').pack(side=tk.LEFT)
-        self._iris_px_gray_lbl = tk.Label(prow1g, text="— px", bg=PANEL, fg=MUTED,
+        self._iris_px_gray_lbl = tk.Label(prow1g, text="— px", bg=PANEL, fg=MUTEDT,
                                            font=('Courier', 7))
         self._iris_px_gray_lbl.pack(side=tk.RIGHT)
 
@@ -282,14 +333,14 @@ class EyeTrackingApp:
         prow2.pack(fill=tk.X, pady=(4, 1))
         tk.Label(prow2, text="Precision", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
-        self._precision_lbl = tk.Label(prow2, text="— mm/px", bg=PANEL, fg=MUTED,
+        self._precision_lbl = tk.Label(prow2, text="— mm/px", bg=PANEL, fg=MUTEDT,
                                         font=('Courier', 9, 'bold'))
         self._precision_lbl.pack(side=tk.RIGHT)
         prow2g = tk.Frame(st, bg=PANEL)
         prow2g.pack(fill=tk.X)
-        tk.Label(prow2g, text="  ↳ B/W", bg=PANEL, fg=MUTED,
+        tk.Label(prow2g, text="  ↳ B/W", bg=PANEL, fg=MUTEDT,
                  font=('Helvetica', 7), width=10, anchor='w').pack(side=tk.LEFT)
-        self._precision_gray_lbl = tk.Label(prow2g, text="— mm/px", bg=PANEL, fg=MUTED,
+        self._precision_gray_lbl = tk.Label(prow2g, text="— mm/px", bg=PANEL, fg=MUTEDT,
                                              font=('Courier', 7))
         self._precision_gray_lbl.pack(side=tk.RIGHT)
 
@@ -297,7 +348,7 @@ class EyeTrackingApp:
         prow3.pack(fill=tk.X, pady=(4, 1))
         tk.Label(prow3, text="2 mm =", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
-        self._px2mm_lbl = tk.Label(prow3, text="— px", bg=PANEL, fg=MUTED,
+        self._px2mm_lbl = tk.Label(prow3, text="— px", bg=PANEL, fg=MUTEDT,
                                     font=('Courier', 9, 'bold'))
         self._px2mm_lbl.pack(side=tk.RIGHT)
 
@@ -307,14 +358,14 @@ class EyeTrackingApp:
         drow.pack(fill=tk.X, pady=1)
         tk.Label(drow, text="Deviation", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
-        self._dev_lbl = tk.Label(drow, text="— mm", bg=PANEL, fg=MUTED,
+        self._dev_lbl = tk.Label(drow, text="— mm", bg=PANEL, fg=MUTEDT,
                                   font=('Courier', 10, 'bold'))
         self._dev_lbl.pack(side=tk.RIGHT)
         drowg = tk.Frame(st, bg=PANEL)
         drowg.pack(fill=tk.X)
-        tk.Label(drowg, text="  ↳ B/W", bg=PANEL, fg=MUTED,
+        tk.Label(drowg, text="  ↳ B/W", bg=PANEL, fg=MUTEDT,
                  font=('Helvetica', 7), width=10, anchor='w').pack(side=tk.LEFT)
-        self._dev_gray_lbl = tk.Label(drowg, text="— mm", bg=PANEL, fg=MUTED,
+        self._dev_gray_lbl = tk.Label(drowg, text="— mm", bg=PANEL, fg=MUTEDT,
                                        font=('Courier', 8))
         self._dev_gray_lbl.pack(side=tk.RIGHT)
 
@@ -333,11 +384,21 @@ class EyeTrackingApp:
 
         inner = tk.Frame(canvas, bg=PANEL)
         win = canvas.create_window((0, 0), window=inner, anchor='nw')
-        inner.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda e: canvas.itemconfig(win, width=e.width))
-        canvas.bind_all('<Button-4>', lambda _: canvas.yview_scroll(-1, 'units'))
-        canvas.bind_all('<Button-5>', lambda _: canvas.yview_scroll( 1, 'units'))
-        canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(-1*(e.delta//120), 'units'))
+        inner.bind('<Configure>',
+                   lambda _: self._sidebar_fit(canvas, sb, scroll_area))
+        canvas.bind('<Configure>',
+                    lambda e: (canvas.itemconfig(win, width=e.width),
+                               self._sidebar_fit(canvas, sb, scroll_area)))
+        self._sidebar = canvas
+
+        # The wheel is bound only while the pointer is actually over the
+        # sidebar. bind_all put it on the whole application, so scrolling over
+        # the camera or the ITS3 strip dragged this column out of place — and it
+        # scrolled even when everything already fitted, because yview_scroll
+        # does not care whether there is anywhere to go.
+        for w in (canvas, inner):
+            w.bind('<Enter>', lambda _e: self._sidebar_wheel(True))
+            w.bind('<Leave>', lambda _e: self._sidebar_wheel(False))
 
         # ── SETTING ──────────────────────────────────
         self._group_header(inner, "SETTING")
@@ -390,7 +451,7 @@ class EyeTrackingApp:
         tk.Checkbutton(orow, text="Loop", variable=self.video_loop,
                        bg=CARD, fg=TEXT2, selectcolor=INSET,
                        activebackground=CARD, font=('Helvetica', 9)).pack(side=tk.LEFT)
-        self.speed_lbl = tk.Label(orow, text="1.00×", bg=CARD, fg=AMBERL,
+        self.speed_lbl = tk.Label(orow, text="1.00×", bg=CARD, fg=AMBER_TXT,
                                    font=('Courier', 9, 'bold'), width=6)
         self.speed_lbl.pack(side=tk.RIGHT)
         tk.Label(orow, text="Speed", bg=CARD, fg=TEXT2,
@@ -439,9 +500,27 @@ class EyeTrackingApp:
         arow.pack(fill=tk.X, padx=12, pady=(0, 2))
         tk.Label(arow, text="Detector", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9)).pack(side=tk.LEFT)
-        self._alpide_lbl = tk.Label(arow, text="—", bg=PANEL, fg=MUTED,
+        self._alpide_lbl = tk.Label(arow, text="—", bg=PANEL, fg=MUTEDT,
                                      font=('Courier', 8))
         self._alpide_lbl.pack(side=tk.RIGHT)
+
+        # Per-plane state, scraped from the RunControl TUI. The label above says
+        # how many boards are attached; this says which of them are actually
+        # taking data, which is the difference between a run and a run that
+        # quietly recorded nothing.
+        prow = tk.Frame(inner, bg=PANEL)
+        prow.pack(fill=tk.X, padx=12, pady=(2, 4))
+        self._plane_leds = []
+        for i in range(config.ALPIDE_NUM):
+            cell = tk.Frame(prow, bg=PANEL)
+            cell.pack(side=tk.LEFT, expand=True)
+            cv = tk.Canvas(cell, width=10, height=10, bg=PANEL,
+                           highlightthickness=0)
+            cv.pack()
+            oval = cv.create_oval(1, 1, 9, 9, fill=MUTED, outline='')
+            tk.Label(cell, text=f'p{i}', bg=PANEL, fg=TEXT2,
+                     font=('Courier', 7)).pack()
+            self._plane_leds.append((cv, oval))
 
         trow2 = tk.Frame(inner, bg=PANEL)
         trow2.pack(fill=tk.X, padx=12, pady=(2, 2))
@@ -452,7 +531,7 @@ class EyeTrackingApp:
                                      relief='flat', justify='right',
                                      font=('Courier', 9))
         self._trig_entry.pack(side=tk.RIGHT)
-        tk.Label(trow2, text="Hz", bg=PANEL, fg=MUTED,
+        tk.Label(trow2, text="Hz", bg=PANEL, fg=MUTEDT,
                  font=('Helvetica', 8)).pack(side=tk.RIGHT, padx=(0, 4))
 
         self._divider(inner)
@@ -482,7 +561,7 @@ class EyeTrackingApp:
         trow.pack(fill=tk.X, padx=12, pady=(6, 2))
         tk.Label(trow, text="Threshold", bg=PANEL, fg=TEXT2,
                  font=('Helvetica', 9)).pack(side=tk.LEFT)
-        self._thr_lbl = tk.Label(trow, text="3.0 mm", bg=PANEL, fg=AMBERL,
+        self._thr_lbl = tk.Label(trow, text="3.0 mm", bg=PANEL, fg=AMBER_TXT,
                                   font=('Courier', 10, 'bold'))
         self._thr_lbl.pack(side=tk.RIGHT)
         self._threshold_scale = tk.Scale(
@@ -492,6 +571,24 @@ class EyeTrackingApp:
             showvalue=False, fg=TEXT,
             command=lambda v: self._thr_lbl.config(text=f"{float(v):.1f} mm"))
         self._threshold_scale.pack(fill=tk.X, padx=12, pady=(0, 6))
+
+        # Minimum time the beam stays off once cut. An eye resting exactly on
+        # the threshold chatters the shutter without it — 35 cuts in 26 s at
+        # 3.0 mm. Only ever delays reopening, never closing.
+        # Typed rather than dragged: unlike the threshold, this is a number
+        # somebody arrives at from the off-periods in a previous run, not one
+        # they hunt for by feel against a live picture.
+        mrow = tk.Frame(inner, bg=PANEL)
+        mrow.pack(fill=tk.X, padx=12, pady=(6, 8))
+        tk.Label(mrow, text="Min beam-off", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        tk.Label(mrow, text="s", bg=PANEL, fg=MUTEDT,
+                 font=('Helvetica', 8)).pack(side=tk.RIGHT, padx=(4, 0))
+        self._minoff_entry = tk.Entry(mrow, textvariable=self.min_off_s, width=6,
+                                       bg=INSET, fg=TEXT, insertbackground=TEXT,
+                                       relief='flat', justify='right',
+                                       font=('Courier', 9))
+        self._minoff_entry.pack(side=tk.RIGHT)
 
         self._divider(inner)
 
@@ -503,8 +600,8 @@ class EyeTrackingApp:
         self._debug_active = False
         self._debug_btn = self._flat_btn(
             inner, "⬤  START DEBUG", self._on_debug_toggle,
-            PANEL, TEXT2, INSET, state=tk.DISABLED)
-        self._debug_lbl = tk.Label(inner, text="", bg=PANEL, fg=MUTED,
+            CARD, TEXT2, INSET, state=tk.DISABLED)
+        self._debug_lbl = tk.Label(inner, text="", bg=PANEL, fg=MUTEDT,
                                     font=('Courier', 8))
         if self.debug:
             self._group_header(inner, "DEBUG")
@@ -539,11 +636,11 @@ class EyeTrackingApp:
         self._beam_oval = self._beam_dot.create_oval(2, 2, 12, 12,
                                                       fill=MUTED, outline='')
         self.beam_lbl = tk.Label(beam_top, text="BEAM OFF",
-                                  bg=CARD, fg=MUTED,
+                                  bg=CARD, fg=MUTEDT,
                                   font=('Helvetica', 13, 'bold'))
         self.beam_lbl.pack(side=tk.LEFT)
         self._beam_sub = tk.Label(self._beam_frame, text="Shutter: Closed",
-                                   bg=CARD, fg=MUTED, font=('Helvetica', 8))
+                                   bg=CARD, fg=MUTEDT, font=('Helvetica', 8))
         self._beam_sub.pack(pady=(4, 0))
 
         # ── Controls ───────────────────────────────
@@ -554,6 +651,16 @@ class EyeTrackingApp:
                                          self._toggle_ready, PANEL, TEXT2, INSET)
         self.ready_btn.pack(fill=tk.X, pady=(0, 3))
         tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
+
+        # Bringing EUDAQ2 up is its own step, as it is in Kcmh-Tricker ("Launch
+        # default"). Folded into START it cost 7.2 s of armed-but-blind beam
+        # gating in the last measured run — three transitions that could never
+        # be timed. Pressed during setup instead, START has detector data from
+        # the very first trigger.
+        self.launch_btn = self._flat_btn(ctrl, "▸   LAUNCH DAQ",
+                                          self._launch_daq, MUTED, PANEL, MUTED,
+                                          state=tk.DISABLED)
+        self.launch_btn.pack(fill=tk.X, pady=(3, 3))
 
         self.start_btn = self._flat_btn(ctrl, "▶   START TRACKING",
                                          self.start, MUTED, PANEL, MUTED)
@@ -567,32 +674,88 @@ class EyeTrackingApp:
         tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
 
         self.pause_btn = self._flat_btn(ctrl, "⏸   PAUSE",
-                                         self._toggle_pause, PANEL, MUTED,
+                                         self._toggle_pause, CARD, TEXT2,
                                          INSET, state=tk.DISABLED)
         self.pause_btn.pack(fill=tk.X)
+
+        # Always available once Enable is asserted, armed or not — cutting the
+        # beam is never the action that needs a precondition. Latching, like
+        # Kcmh-Tricker's Kill beam: the eye cannot reopen the shutter until an
+        # operator releases it.
+        tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X, pady=(6, 0))
+        self.kill_btn = self._flat_btn(ctrl, "✕   KILL BEAM",
+                                        self._toggle_kill, MUTED, PANEL, MUTED,
+                                        state=tk.DISABLED)
+        self.kill_btn.pack(fill=tk.X, pady=(6, 0))
 
         self._divider(right)
 
         # ── Record ─────────────────────────────────
         self._section_header(right, "RECORDING  (camera only)")
-        self.rec_timer_lbl = tk.Label(right, text="", bg=PANEL, fg=REDL,
+        self.rec_timer_lbl = tk.Label(right, text="", bg=PANEL, fg=RED_TXT,
                                        font=('Courier', 9, 'bold'))
         self.rec_timer_lbl.pack(pady=(2, 2))
         self.rec_btn = self._flat_btn(right, "⏺   RECORD",
-                                       self._toggle_rec, PANEL, MUTED, INSET,
+                                       self._toggle_rec, CARD, TEXT2, INSET,
                                        state=tk.DISABLED)
         self.rec_btn.pack(fill=tk.X, padx=12, pady=(0, 3))
         self.review_btn = self._flat_btn(right, "▶   REVIEW",
                                           self._review_last_recording,
-                                          PANEL, MUTED, INSET, state=tk.DISABLED)
+                                          CARD, TEXT2, INSET, state=tk.DISABLED)
         self.review_btn.pack(fill=tk.X, padx=12, pady=(0, 8))
 
         # ── Camera feed ────────────────────────────
-        feed = tk.Frame(self.root, bg='#060E16')
+        feed = tk.Frame(self.root, bg=FEED_BG)
         feed.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.camera_label = tk.Label(feed, bg='#060E16', cursor='crosshair')
+
+        # ── ITS3 monitor (bottom strip, collapsed) ─
+        # Along the bottom rather than as a column: RunControl draws an 80-column
+        # table, which fits across the full width without scrolling and does not
+        # fit in any column narrow enough to be worth giving up permanently.
+        # Folded away by default — the six plane dots in the sidebar already
+        # answer "are all six taking data?", and this is the drill-down for when
+        # one of them says otherwise.
+        self._its3_open = False
+        self.camera_label = tk.Label(feed, bg=FEED_BG, cursor='crosshair')
         self.camera_label.pack(fill=tk.BOTH, expand=True)
         self.camera_label.bind('<Button-1>', self._on_feed_click)
+
+        # place() rather than pack(): packing gave the strip its own row, which
+        # squeezed the picture every time it opened. Placed, the sheet lies over
+        # the picture instead, so the camera view never resizes or shifts — and
+        # a view that jumps whenever a diagnostic is consulted is a bad view to
+        # be aiming a proton beam with.
+        self._its3_tab = tk.Label(feed, text="▸ ITS3", bg=PANEL, fg=TEXT2,
+                                   font=('Helvetica', 8, 'bold'),
+                                   padx=10, pady=3, cursor='hand2')
+        self._its3_tab.place(relx=0.0, rely=1.0, x=8, y=-6, anchor='sw')
+        self._its3_tab.bind('<Button-1>', lambda _e: self._toggle_its3())
+
+        self._its3_body = tk.Frame(feed, bg=PANEL,
+                                   highlightthickness=1, highlightbackground=CYANL)
+        # Sized in characters, not pixels, and the frame is left to shrink-wrap
+        # it — so the sheet comes up exactly as big as RunControl's screen with
+        # no empty margin and nothing cut off.
+        self._its3_text = tk.Text(self._its3_body,
+                                   width=self._ITS3_COLS, height=self._ITS3_LINES,
+                                   bg=INSET, fg=TEXT,
+                                   font=('Courier', 8), relief='flat',
+                                   highlightthickness=0, wrap='none',
+                                   padx=6, pady=4, state=tk.DISABLED)
+        self._its3_text.pack()
+        # Colour is applied here rather than captured from the pane. RunControl
+        # does emit ANSI, but reproducing its palette would mean parsing escape
+        # codes off an alternate-screen pane to end up highlighting whatever the
+        # TUI happened to choose. Tagging the plane states ourselves puts the
+        # colour on the thing actually being looked for, and uses the same
+        # green/amber/red as the six dots in the sidebar.
+        for tag, colour in (('run', GREEN_TXT), ('err', RED_TXT),
+                            ('warn', AMBER_TXT), ('name', CYANL),
+                            ('chrome', MUTEDT)):
+            self._its3_text.tag_configure(tag, foreground=colour)
+        self._its3_text.tag_configure('run', font=('Courier', 8, 'bold'))
+        self._its3_text.tag_configure('err', font=('Courier', 8, 'bold'))
+        self._its3_text.tag_configure('name', font=('Courier', 8, 'bold'))
 
     # ── Source ─────────────────────────────────────
 
@@ -603,13 +766,7 @@ class EyeTrackingApp:
             self.arduino.send(b'B0\n')
             self._beam_off()
             self._teardown_capture()
-            if self.ready:
-                self.start_btn.config(state=tk.NORMAL, bg=CYAN, fg=CYAND,
-                                      activebackground=CYAND, activeforeground=CYAND)
-            else:
-                self.start_btn.config(state=tk.NORMAL, bg=MUTED, fg=PANEL)
-            self.stop_btn.config(state=tk.DISABLED, bg=CARD, fg=TEXT2,
-                                 activebackground=INSET, activeforeground=TEXT2)
+            self._refresh_flow()
         self.input_mode.set(value)
         self._update_tabs()
         self._toggle_video_panel()
@@ -731,13 +888,13 @@ class EyeTrackingApp:
         self._rec_start_time = time.time()
         self.rec_btn.config(text="⏹   STOP REC", bg=REDB, fg=REDL,
                             activebackground=REDB, activeforeground=REDL)
-        self.review_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTED)
+        self.review_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTEDT)
         self._tick_rec()
 
     def _stop_rec(self):
         if self.capture:
             self.capture.stop_recording()
-        self.rec_btn.config(text="⏺   RECORD", bg=PANEL, fg=MUTED,
+        self.rec_btn.config(text="⏺   RECORD", bg=PANEL, fg=MUTEDT,
                             activebackground=INSET, activeforeground=TEXT2)
         self.rec_timer_lbl.config(text="")
         if self._rec_path:
@@ -785,14 +942,14 @@ class EyeTrackingApp:
                                    bg=AMBERB, fg=AMBERL,
                                    activebackground=AMBERB, activeforeground=AMBERL)
             self._debug_lbl.config(
-                text=f"→ {os.path.basename(self._session_root)}/debug", fg=AMBERL)
+                text=f"→ {os.path.basename(self._session_root)}/debug", fg=AMBER_TXT)
         else:
             self.capture.debug_enabled = False
             self._debug_active = False
             self._debug_btn.config(text="⬤  START DEBUG",
                                    bg=PANEL, fg=TEXT2,
                                    activebackground=INSET, activeforeground=TEXT)
-            self._debug_lbl.config(text="saved", fg=GREENL)
+            self._debug_lbl.config(text="saved", fg=GREEN_TXT)
 
     # ── Detection method ───────────────────────────
 
@@ -813,20 +970,20 @@ class EyeTrackingApp:
 
     def _update_precision(self, iris_px):
         if iris_px is None or iris_px <= 0:
-            self._iris_px_lbl.config(text="— px",     fg=MUTED)
-            self._precision_lbl.config(text="— mm/px", fg=MUTED)
-            self._px2mm_lbl.config(text="— px",       fg=MUTED)
+            self._iris_px_lbl.config(text="— px",     fg=MUTEDT)
+            self._precision_lbl.config(text="— mm/px", fg=MUTEDT)
+            self._px2mm_lbl.config(text="— px",       fg=MUTEDT)
             return
         mm_per_px   = config.IRIS_MM / iris_px
         px_per_2mm  = 2.0 / mm_per_px
         if mm_per_px < 0.20:
-            color, badge = GREENL, "GOOD"
+            color, badge = GREEN_TXT, "GOOD"
         elif mm_per_px < 0.40:
             color, badge = CYANL,  "OK"
         elif mm_per_px < 0.60:
-            color, badge = AMBERL, "LOW"
+            color, badge = AMBER_TXT, "LOW"
         else:
-            color, badge = REDL,   "POOR"
+            color, badge = RED_TXT,  "POOR"
         self._iris_px_lbl.config(
             text=f"{iris_px} px", fg=color)
         self._precision_lbl.config(
@@ -836,15 +993,15 @@ class EyeTrackingApp:
 
     def _update_deviation(self, deviation_mm):
         if deviation_mm is None:
-            self._dev_lbl.config(text="— mm", fg=MUTED)
+            self._dev_lbl.config(text="— mm", fg=MUTEDT)
             return
         thr = self._p.get('threshold_mm', 3.0)
         if deviation_mm <= thr * 0.5:
-            color = GREENL
+            color = GREEN_TXT
         elif deviation_mm <= thr:
-            color = AMBERL
+            color = AMBER_TXT
         else:
-            color = REDL
+            color = RED_TXT
         self._dev_lbl.config(text=f"{deviation_mm:.2f} mm", fg=color)
 
     # ── Grayscale cross-check readouts (comparison only) ───────
@@ -860,15 +1017,15 @@ class EyeTrackingApp:
 
     def _update_deviation_gray(self, deviation_mm):
         if deviation_mm is None:
-            self._dev_gray_lbl.config(text="— mm", fg=MUTED)
+            self._dev_gray_lbl.config(text="— mm", fg=MUTEDT)
             return
         thr = self._p.get('threshold_mm', 3.0)
         if deviation_mm <= thr * 0.5:
-            color = GREENL
+            color = GREEN_TXT
         elif deviation_mm <= thr:
-            color = AMBERL
+            color = AMBER_TXT
         else:
-            color = REDL
+            color = RED_TXT
         self._dev_gray_lbl.config(text=f"{deviation_mm:.2f} mm", fg=color)
 
     # ── Beam indicator ─────────────────────────────
@@ -881,11 +1038,22 @@ class EyeTrackingApp:
         self._beam_sub.config(text="Shutter: Open", bg=REDB, fg=REDL)
 
     def _beam_off(self):
+        # Called from the frame loop on every off frame, so the killed state has
+        # to be resolved here — set anywhere else it would be overwritten within
+        # a frame. "Off because the eye moved" and "off because an operator cut
+        # it" need to look different: the second one will not clear by itself.
+        if self._killed:
+            self._beam_frame.config(bg=REDB)
+            self._beam_dot.config(bg=REDB)
+            self._beam_dot.itemconfig(self._beam_oval, fill=REDL)
+            self.beam_lbl.config(text="BEAM KILLED", bg=REDB, fg=REDL)
+            self._beam_sub.config(text="Cut by operator", bg=REDB, fg=REDL)
+            return
         self._beam_frame.config(bg=CARD)
         self._beam_dot.config(bg=CARD)
         self._beam_dot.itemconfig(self._beam_oval, fill=MUTED)
-        self.beam_lbl.config(text="BEAM OFF", bg=CARD, fg=MUTED)
-        self._beam_sub.config(text="Shutter: Closed", bg=CARD, fg=MUTED)
+        self.beam_lbl.config(text="BEAM OFF", bg=CARD, fg=MUTEDT)
+        self._beam_sub.config(text="Shutter: Closed", bg=CARD, fg=MUTEDT)
 
     # ── Ready check ─────────────────────────────────
     # Precondition gate (Arduino + camera connected) that also drives the DB9
@@ -907,10 +1075,7 @@ class EyeTrackingApp:
             self.ready = True
             self.arduino.send(b'E1\n')
             self._alpide_prepare()      # flash FX3 images if boards are in DFU
-            self.ready_btn.config(text="●   UNREADY", bg=GREENB, fg=GREENL,
-                                  activebackground=GREENB, activeforeground=GREENL)
-            self.start_btn.config(bg=CYAN, fg=CYAND,
-                                  activebackground=CYAND, activeforeground=CYAND)
+            self._set_launch_state('idle')
         else:
             if self.capture and self.capture.running and self.capture.armed:
                 choice = self._confirm_disable_dialog()
@@ -921,9 +1086,8 @@ class EyeTrackingApp:
                 self.stop()
             self.arduino.send(b'E0\n')
             self.ready = False
-            self.ready_btn.config(text="○   READY", bg=PANEL, fg=TEXT2,
-                                  activebackground=INSET, activeforeground=TEXT)
-            self.start_btn.config(bg=MUTED, fg=PANEL)
+            self._release_kill()        # Enable is down; the latch means nothing now
+            self._set_launch_state('locked')
 
     def _confirm_disable_dialog(self):
         result = {'choice': 'cancel'}
@@ -1011,12 +1175,12 @@ class EyeTrackingApp:
             on_progress=self._on_progress,
             armed=armed,
         )
+        # A latch set before this thread existed still applies to it: swapping
+        # the camera or the source must not quietly hand the beam back.
+        self.capture.kill_latched = self._killed
         self.capture.start()
 
-        if armed:
-            self.start_btn.config(state=tk.DISABLED, bg=MUTED, fg=PANEL)
-            self.stop_btn.config(state=tk.NORMAL, bg=REDB, fg=REDL,
-                                 activebackground=REDB, activeforeground=REDL)
+        self._refresh_flow()
         self._debug_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
                                activebackground=INSET, activeforeground=TEXT)
 
@@ -1027,9 +1191,9 @@ class EyeTrackingApp:
             self.prog_slider.config(state=tk.NORMAL)
             self.prog_lbl.config(
                 text=f"00:00 / {self._fmt(self._video_total_frames / self._video_fps)}")
-            self.rec_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTED)
+            self.rec_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTEDT)
         else:
-            self.pause_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTED,
+            self.pause_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTEDT,
                                   text="⏸   PAUSE")
             self.prog_slider.config(state=tk.DISABLED)
             self.rec_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
@@ -1041,12 +1205,14 @@ class EyeTrackingApp:
         """Fully close the capture thread and camera/video device."""
         if self.capture:
             self.capture.stop_recording()
+            self.capture.stop_cut_capture()   # closes cuts.csv on any teardown,
+                                              # not only the one that goes via stop()
             self.capture.stop()
             self.capture = None
         if self.cap:
             self.cap.release()
             self.cap = None
-        self.camera_label.config(image='', bg='#060E16')
+        self.camera_label.config(image='', bg=FEED_BG)
         self._led_set(self._cam_led, False)
         self._update_precision(None)
         self._update_deviation(None)
@@ -1057,15 +1223,15 @@ class EyeTrackingApp:
         self._p['main_view'] = 'wide'
         self._last_view_meta = None
         self.pause_btn.config(text="⏸   PAUSE", state=tk.DISABLED,
-                              bg=PANEL, fg=MUTED)
+                              bg=PANEL, fg=MUTEDT)
         self.prog_slider.config(state=tk.DISABLED)
         self.rec_btn.config(text="⏺   RECORD", state=tk.DISABLED,
-                            bg=PANEL, fg=MUTED)
+                            bg=PANEL, fg=MUTEDT)
         self.rec_timer_lbl.config(text="")
         if self._debug_active:
             self._debug_active = False
         self._debug_btn.config(text="⬤  START DEBUG", state=tk.DISABLED,
-                               bg=PANEL, fg=MUTED)
+                               bg=PANEL, fg=MUTEDT)
         self._debug_lbl.config(text="")
 
     def _set_config_locked(self, locked):
@@ -1079,6 +1245,7 @@ class EyeTrackingApp:
         self._fm_tab.config(state=state)
         self._fp_tab.config(state=state)
         self._threshold_scale.config(state=state)
+        self._minoff_entry.config(state=state)
         self._trig_entry.config(state=state)
         if self.debug:
             self._cam_tab.config(state=state)
@@ -1088,30 +1255,63 @@ class EyeTrackingApp:
         if not self.ready:
             messagebox.showerror("Not ready", "กรุณากด READY ก่อนเริ่ม tracking")
             return
+        # A kill left latched from an earlier run would silently hold the beam
+        # off through this one, looking exactly like an eye that never gets on
+        # target. Refuse rather than start into that.
+        if self._killed:
+            messagebox.showwarning(
+                "Beam killed",
+                "KILL BEAM ค้างอยู่ — กดปล่อยก่อนเริ่ม tracking")
+            return
         self._set_config_locked(True)
-        # a fresh folder per run, unless RECORD/debug already opened one
+        self._min_off_value()      # normalise the typed box against what is in force
+        # a fresh folder per run, unless LAUNCH/RECORD/debug already opened one
         if not self._session_root:
             self._session_dir()
         self._session_started = datetime.now().isoformat()
         self._write_session_json()
-        # The trigger only clocks the ALPIDE readout — beam gating runs off the
-        # relays alone — so it is started later, once the run is up, rather than
-        # here. That costs nothing in beam latency and makes the board's pulse
-        # counter share an origin with EUDAQ's trigger number.
+        # Only the trigger is started here, and only if LAUNCH already brought
+        # EUDAQ2 up; T1 resets the board's pulse counter, so it must not fire
+        # before the run is RUNNING or the pulse counts and EUDAQ's trigger
+        # numbers no longer share an origin.
         self._alpide_start(self._trigger_hz_value())
+        self._set_launch_state('locked')
         if self.capture and self.capture.running:
             # preview is already live (camera mode) — just arm the beam relay
             self.capture.armed = True
-            self.start_btn.config(state=tk.DISABLED, bg=MUTED, fg=PANEL)
-            self.stop_btn.config(state=tk.NORMAL, bg=REDB, fg=REDL,
-                                 activebackground=REDB, activeforeground=REDL)
+            self._begin_cut_capture()
+            self._refresh_flow()
             return
         self._open_capture(armed=True)
+        self._begin_cut_capture()
+
+    def _begin_cut_capture(self):
+        """Save the screen at every beam-off for the whole armed window.
+
+        Tied to arming, not to the RECORD button: five of the first eight
+        sessions recorded no video because nobody pressed it, and a beam cut
+        with no picture of the eye cannot be explained afterwards. Best-effort
+        like the ALPIDE path — a failure here must not stop tracking.
+        """
+        if not self.capture:
+            return
+        try:
+            self.capture.start_cut_capture(self._session_dir('cuts'))
+        except Exception as e:
+            print(f'[CUTS] not capturing: {type(e).__name__}: {e}')
 
     def stop(self):
         """Disarm the beam relay. In camera mode the preview keeps running
         (so the picture never goes blank between runs); video playback fully
         stops, matching the old behaviour."""
+        # Cutting the beam and dropping the gate are one action, so they happen
+        # together and first. Disarming later — after the ALPIDE teardown and
+        # the session write, as this used to — leaves the capture loop armed for
+        # tens of milliseconds, and its periodic re-statement of the current
+        # decision (CaptureThread._BEAM_REFRESH_N) would send B1 again if the
+        # eye happened to be on target: the beam coming back on after STOP.
+        if self.capture:
+            self.capture.armed = False
         self.arduino.send(b'B0\n')
         self._beam_off()
         self._set_config_locked(False)
@@ -1121,8 +1321,17 @@ class EyeTrackingApp:
             self._write_session_json(stopped=datetime.now().isoformat())
             print(f'[SESSION] {self._session_root}')
             self._session_root = ''    # next run starts a new folder
+        # The run is over and its .raw is closed, so the next one has to launch
+        # its own — the output path was baked into the EUDAQ2 config.
+        self._pending_start_hz = None   # a launch still in flight must not
+                                        # start a trigger for a finished run
+        self._set_launch_state('idle' if self.ready else 'locked')
+        self._release_kill()           # end of run: back to a neutral state
         if self.capture:
-            self.capture.armed = False
+            # After disarming, so the queue cannot gain another entry while it
+            # is being drained. The beam is already off, so the few milliseconds
+            # this waits for the writer cost nothing.
+            self.capture.stop_cut_capture()
 
         if self.input_mode.get() == 'video':
             self._teardown_capture()
@@ -1135,13 +1344,7 @@ class EyeTrackingApp:
                                 activebackground=INSET, activeforeground=TEXT)
             self.rec_timer_lbl.config(text="")
 
-        if self.ready:
-            self.start_btn.config(state=tk.NORMAL, bg=CYAN, fg=CYAND,
-                                  activebackground=CYAND, activeforeground=CYAND)
-        else:
-            self.start_btn.config(state=tk.NORMAL, bg=MUTED, fg=PANEL)
-        self.stop_btn.config(state=tk.DISABLED, bg=CARD, fg=TEXT2,
-                             activebackground=INSET, activeforeground=TEXT2)
+        self._refresh_flow()
 
     # ── Frame display ──────────────────────────────
 
@@ -1206,6 +1409,33 @@ class EyeTrackingApp:
     # and "no protons" would be indistinguishable from "not looking", which is
     # exactly the comparison the measurement rests on.
 
+    _MIN_OFF_MAX_S = 60.0
+
+    def _sync_min_off(self):
+        """Push the typed hold into the params the capture thread reads.
+
+        Runs on every keystroke, so a half-typed box ("", "1.") must leave the
+        gate on the last good value rather than throwing or resetting it to
+        something the operator did not choose.
+        """
+        try:
+            v = float(self.min_off_s.get())
+        except (tk.TclError, ValueError):
+            return
+        self._p['min_off_s'] = max(0.0, min(self._MIN_OFF_MAX_S, v))
+
+    def _min_off_value(self):
+        """Read, clamp and write back — called at START so the box agrees with
+        what is actually in force, the same way the trigger rate is handled."""
+        try:
+            v = float(self.min_off_s.get())
+        except (tk.TclError, ValueError):
+            v = config.DEFAULT_MIN_OFF_S
+        v = max(0.0, min(self._MIN_OFF_MAX_S, v))
+        self.min_off_s.set(v)
+        self._p['min_off_s'] = v
+        return v
+
     def _trigger_hz_value(self):
         """Read and clamp the rate on the UI thread — Tk variables must not be
         touched from the acquisition worker."""
@@ -1260,6 +1490,7 @@ class EyeTrackingApp:
             'eye_side':       self.eye_side.get(),
             'detect_method':  self.detect_method.get(),
             'threshold_mm':   self.threshold_mm.get(),
+            'min_off_s':      self._p.get('min_off_s', config.DEFAULT_MIN_OFF_S),
             'target_x':       self.center_x.get(),
             'target_y':       self.center_y.get(),
             'trigger_hz':     self.trigger_hz.get(),
@@ -1302,10 +1533,112 @@ class EyeTrackingApp:
             self._alpide_state, self._alpide_board_msg = state, msg
         state = getattr(self, '_alpide_state', 'missing')
         msg = getattr(self, '_alpide_board_msg', '—')
-        colour = {'ready': GREENL, 'unprogrammed': AMBERL,
-                  'partial': AMBERL, 'missing': MUTED}.get(state, MUTED)
+        colour = {'ready': GREEN_TXT, 'unprogrammed': AMBER_TXT,
+                  'partial': AMBER_TXT, 'missing': MUTED}.get(state, MUTED)
         run = f'  ·  {self._alpide_msg}' if self._alpide_msg else ''
         self._alpide_lbl.config(text=f'{msg}{run}', fg=colour)
+
+    # ── ITS3 monitor ───────────────────────────────
+    # RunControl's TUI is the only place the per-plane state exists, and it
+    # lives in a tmux pane that nothing else looks at. One capture-pane per tick
+    # feeds all three consumers: the plane dots, the terminal, and the log kept
+    # for the session.
+
+    def _toggle_its3(self):
+        self._its3_open = not self._its3_open
+        if self._its3_open:
+            # Anchored to the bottom-left corner, sitting just above its own
+            # tab: the eye is usually mid-frame, so the corner is the part of
+            # the picture least likely to be worth seeing.
+            self._its3_body.place(relx=0.0, rely=1.0, x=8, y=-28, anchor='sw')
+            self._its3_body.lift()
+            self._its3_tab.lift()
+            self._its3_tab.config(text="▾ ITS3", bg=CYANL, fg='white')
+            self._its3_last = None          # force a redraw on the next tick
+        else:
+            self._its3_body.place_forget()
+            self._its3_tab.config(text="▸ ITS3", bg=PANEL, fg=TEXT2)
+
+    def _its3_tick(self):
+        """Same shape as _alpide_status_tick: tmux shells out, so it happens on
+        a worker thread and only the widget update runs on the UI thread."""
+        def _work():
+            text = alpide_daq.pane_text()
+            self.root.after(0, lambda: self._its3_show(text))
+        threading.Thread(target=_work, daemon=True).start()
+        self.root.after(config.ITS3_POLL_MS, self._its3_tick)
+
+    def _its3_show(self, text):
+        self._its3_pane = text          # kept for the log written at STOP
+        states = alpide_daq.plane_states(text)
+        for i, (canvas, oval) in enumerate(self._plane_leds):
+            state = states.get(i)
+            if state is None:
+                colour = MUTED
+            elif state == 'RUNNING':
+                colour = GREEN_TXT
+            elif 'ERROR' in state:
+                colour = RED_TXT
+            else:
+                colour = AMBER_TXT
+            canvas.itemconfig(oval, fill=colour)
+
+        # Writing several hundred lines into a Text widget is the expensive part
+        # of this, not the poll — so it only happens while the panel is open,
+        # and only when the pane actually changed.
+        if not self._its3_open or text == getattr(self, '_its3_last', None):
+            return
+        self._its3_last = text
+        body = text.rstrip()
+        self._its3_text.config(state=tk.NORMAL)
+        self._its3_text.delete('1.0', tk.END)
+        self._its3_text.insert('1.0', body)
+        self._its3_colourise(body)
+        # Top of the screen, pinned to the left margin: RunControl redraws a
+        # fixed screen rather than scrolling, so its first line is the start of
+        # the table and not stale history. see(END) would scroll sideways to the
+        # end of the longest line as well, pushing the plane names off view.
+        self._its3_text.yview_moveto(0.0)
+        self._its3_text.xview_moveto(0.0)
+        self._its3_text.config(state=tk.DISABLED)
+
+    # The states RunControl puts in its connection table.
+    _RE_PLANE = re.compile(r'ALPIDE_plane_\d+')
+    _RE_STATE = re.compile(
+        r'\b(RUNNING|CONFIGURED|STARTING|STOPPED|ERROR|UNINIT|UNCONF|BUSY)\b')
+    _STATE_TAG = {'RUNNING': 'run', 'ERROR': 'err'}
+    _CHROME = set('│─┌┐└┘├┤┬┴┼█▄▀▌▐ ')
+
+    def _its3_colourise(self, body):
+        """Tag plane names and states so the table can be read at a glance."""
+        t = self._its3_text
+        for tag in ('run', 'err', 'warn', 'name', 'chrome'):
+            t.tag_remove(tag, '1.0', tk.END)
+        for n, line in enumerate(body.splitlines(), start=1):
+            if line and all(ch in self._CHROME for ch in line):
+                t.tag_add('chrome', f'{n}.0', f'{n}.end')
+                continue
+            for m in self._RE_PLANE.finditer(line):
+                t.tag_add('name', f'{n}.{m.start()}', f'{n}.{m.end()}')
+            for m in self._RE_STATE.finditer(line):
+                t.tag_add(self._STATE_TAG.get(m.group(1), 'warn'),
+                          f'{n}.{m.start()}', f'{n}.{m.end()}')
+
+    def _save_its3_log(self, folder):
+        """Keep what RunControl said, before the session is killed.
+
+        stop_run() tears the tmux session down and its scrollback goes with it,
+        which is why a run that failed has so far left no trace of why.
+        """
+        text = getattr(self, '_its3_pane', '') or alpide_daq.pane_text()
+        if not text.strip():
+            return
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, 'eudaq.log'), 'w') as f:
+                f.write(text.rstrip() + '\n')
+        except Exception as e:
+            print(f'[ALPIDE] could not save eudaq.log: {type(e).__name__}: {e}')
 
     def _alpide_note(self, msg):
         """Called from worker threads, so the label refresh is marshalled back to
@@ -1342,55 +1675,246 @@ class EyeTrackingApp:
             target=lambda: alpide_daq.install_firmware(on_done=_done),
             daemon=True).start()
 
-    def _alpide_start(self, hz):
-        """Launch acquisition in the background and arm regardless of how it
-        goes. Waiting for EUDAQ2 to come up takes ~10 s; holding the beam back
-        that long would be worse than losing the first few seconds of detector
-        data, and the transitions being measured repeat throughout the run.
+    # ── FLOW button appearance ─────────────────────
+    # Every button in the FLOW column is painted from one place, by state. The
+    # order READY → LAUNCH → START → STOP is numbered on the buttons, and
+    # exactly one of them is bright at any moment: the step to press next.
+    # Previously each handler configured buttons itself from seventeen separate
+    # places, and the colours ended up saying nothing about what came next.
 
-        The trigger is started at the end of this, once RunControl reports
-        RUNNING. Doing it here rather than in start() is what makes the pulse
-        counts in beam_events.csv directly comparable with the trigger numbers
-        stored in the .raw: both then count from the same first pulse. Started
-        earlier, the two would differ by however many pulses were emitted while
-        EUDAQ2 was still coming up — about six thousand in one measured run."""
-        if self._alpide_pid is not None:
+    # bg, fg — by role rather than by button
+    _NEXT   = (CYAN,  CYAND)    # the step to take now
+    _DANGER = (REDB,  REDL)     # the step to take now, and it stops the beam
+    _DONE   = (GREENB, GREENL)  # already done, nothing to do here
+    _OPEN   = (CARD,  TEXT)     # allowed, but not the expected next step
+    _OFF    = (MUTED, MUTEDT)   # not available yet
+
+    def _paint(self, btn, text, role, enabled):
+        bg, fg = role
+        btn.config(text=text, bg=bg, fg=fg, activebackground=bg,
+                   activeforeground=fg,
+                   state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _refresh_flow(self):
+        """Repaint the whole FLOW column from current state. UI thread only."""
+        armed = bool(self.capture and self.capture.armed)
+        launching = self._launch_state == 'launching'
+
+        # 1 READY — the only step available before anything else
+        self._paint(self.ready_btn,
+                    "●   1  UNREADY" if self.ready else "○   1  READY",
+                    self._DONE if self.ready else self._NEXT, True)
+
+        # 2 LAUNCH DAQ
+        if not self.ready:
+            self._paint(self.launch_btn, "▸   2  LAUNCH DAQ", self._OFF, False)
+        elif launching:
+            self._paint(self.launch_btn, "    2  launching…", self._OPEN, False)
+        elif self._daq_ready:
+            self._paint(self.launch_btn, "✓   2  DAQ READY", self._DONE, False)
+        elif armed:
+            self._paint(self.launch_btn, "▸   2  LAUNCH DAQ", self._OFF, False)
+        else:
+            self._paint(self.launch_btn, "▸   2  LAUNCH DAQ", self._NEXT, True)
+
+        # 3 START — allowed without LAUNCH (it falls back to launching itself),
+        # but only styled as the next step once the DAQ is actually up, so the
+        # bright button always points at the path that keeps all the data.
+        if armed or not self.ready:
+            self._paint(self.start_btn, "▶   3  START TRACKING", self._OFF, False)
+        elif self._daq_ready:
+            self._paint(self.start_btn, "▶   3  START TRACKING", self._NEXT, True)
+        else:
+            self._paint(self.start_btn, "▶   3  START TRACKING", self._OPEN, True)
+
+        # 4 STOP — the next step for as long as a run is in progress
+        self._paint(self.stop_btn, "■   4  STOP",
+                    self._DANGER if armed else self._OFF, armed)
+
+        # KILL BEAM — outside the numbering; available whenever Enable is up
+        if self._killed:
+            self._paint(self.kill_btn, "✕   KILLED — click to release",
+                        self._DANGER, True)
+        else:
+            self._paint(self.kill_btn, "✕   KILL BEAM",
+                        self._DANGER if self.ready else self._OFF, self.ready)
+
+    def _set_launch_state(self, state):
+        """UI thread only. 'idle' | 'launching' | 'ready' | 'locked'."""
+        self._launch_state = state
+        self._daq_ready = (state == 'ready')
+        self._refresh_flow()
+
+    # ── Kill beam ──────────────────────────────────
+    # Kcmh-Tricker's Kill beam, which is a toggle rather than a one-shot: while
+    # it is held the run cannot reopen the shutter. Here the "run" is the eye,
+    # so latching is what makes the button mean anything — without it the next
+    # frame with the eye on target would undo the cut within ~66 ms.
+
+    def _toggle_kill(self):
+        if self._killed:
+            self._release_kill()
             return
+        self._killed = True
+        if self.capture:
+            self.capture.kill_latched = True
+        # Do not wait for the capture loop to notice: send it here as well, so
+        # the shutter closes on the click rather than up to a frame later.
+        self.arduino.send(b'B0\n')
+        self._beam_off()
+        self._refresh_flow()
+        print('[BEAM] killed by operator')
+
+    def _release_kill(self):
+        """Hand the beam back to the eye. Safe to call when nothing is latched."""
+        if not self._killed:
+            return
+        self._killed = False
+        if self.capture:
+            self.capture.kill_latched = False
+        self._refresh_flow()
+        # The frame loop repaints this anyway while a capture is running, but
+        # not when one is not — repaint here so the panel cannot be left
+        # claiming a kill that is no longer in force.
+        self._beam_off()
+        print('[BEAM] kill released')
+
+    def _alpide_open_dir(self):
+        """Bind this run's output folder. Whichever of LAUNCH or START happens
+        first calls it — start_run() bakes the path into the EUDAQ2 config, so
+        one launch means one folder and one .raw."""
         self._alpide_dir = self._session_dir('alpide')
         self._open_ev_log(self._alpide_dir)
 
+    def _alpide_bring_up(self):
+        """Get EUDAQ2 to RUNNING. Returns True if it got there.
+
+        Deliberately stops short of the trigger: T1 resets the board's pulse
+        counter and so defines pulse 0, which only lines up with EUDAQ's first
+        trigger number if the run is already up. Started earlier the two differ
+        by however many pulses were emitted while EUDAQ2 was coming up — about
+        six thousand in one measured run.
+
+        Runs on a worker thread in both callers; touches only _alpide_* state.
+        """
+        state = alpide_daq.session_state()
+        if state == 'running':
+            # genuinely acquiring — the ITS3 session and the six boards are
+            # machine-wide, and racing KCMH-Tricker would corrupt both runs
+            self._alpide_note('ITS3 กำลังใช้งานอยู่ — ไม่ได้บันทึก')
+            self._alpide_failed = 'ITS3 session busy'
+            return False
+        if state == 'stale':
+            self._alpide_note('เก็บกวาด ITS3 session ที่ค้างอยู่')
+            alpide_daq.kill_session()
+            time.sleep(2)
+        bstate, msg = alpide_daq.status()
+        if bstate != 'ready':
+            self._alpide_note(f'ไม่ได้บันทึก ({msg})')
+            self._alpide_failed = msg
+            return False
+        self._alpide_pid = alpide_daq.start_run(self._alpide_dir)
+        self._alpide_note('acquisition starting…')
+        if not alpide_daq.wait_for_running():
+            self._alpide_note('run ไม่ขึ้นสถานะ RUNNING — ดู rc.log')
+            self._alpide_failed = 'never reached RUNNING'
+            return False
+        return True
+
+    def _alpide_run_trigger(self, hz):
+        """Start the readout clock and confirm data is landing. Worker thread."""
+        self._trigger_on(hz)      # defines pulse 0 == first trigN
+        if alpide_daq.wait_for_data(self._alpide_dir):
+            self._alpide_note(f'recording @ {hz} Hz')
+        else:
+            self._alpide_note('running but no data — check rc.log')
+        self._alpide_failed = None
+
+    def _launch_daq(self):
+        """LAUNCH DAQ — Kcmh-Tricker's "Launch default" as its own step.
+
+        Bringing EUDAQ2 up takes ~10 s. Done from inside START, that was 10 s of
+        the beam being gated with no detector recording it: 7.2 s and three
+        untimeable transitions in the last measured run. Done here, during
+        setup, START has data from the first trigger and still arms instantly —
+        which is what the three-second START/Beam On rule needs.
+        """
+        if self._alpide_pid is not None or self._alpide_busy:
+            return
+        self._alpide_open_dir()
+        # so a folder that is launched but never started still describes itself
+        self._session_started = datetime.now().isoformat()
+        self._write_session_json()
+        self._set_launch_state('launching')
+
+        def _work():
+            ok = False
+            try:
+                ok = self._alpide_bring_up()
+            except Exception as e:
+                self._alpide_note(f'launch failed: {type(e).__name__}: {e}')
+                self._alpide_failed = f'{type(e).__name__}: {e}'
+            self.root.after(0, lambda: self._launch_done(ok))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _launch_done(self, ok):
+        """UI thread: the launch worker has finished bringing EUDAQ2 up.
+
+        Resolving the deferred start here rather than in the worker keeps every
+        read and write of _daq_ready and _pending_start_hz on one thread, so
+        START cannot slip in between the worker deciding it is done and the app
+        recording that it is.
+        """
+        self._set_launch_state('ready' if ok else 'idle')
+        hz, self._pending_start_hz = self._pending_start_hz, None
+        if hz is None:
+            if ok:
+                self._alpide_note('DAQ พร้อม — รอ START')
+            return
+        if ok:
+            # START was pressed while this was still coming up
+            threading.Thread(target=lambda: self._alpide_run_trigger(hz),
+                             daemon=True).start()
+        else:
+            self._alpide_note('DAQ ไม่ขึ้น — ไม่มี trigger สำหรับ run นี้')
+            # Keep whatever _alpide_bring_up() diagnosed ('ITS3 session busy',
+            # a board message). 'not started' is only the initial value, so it
+            # says nothing and is worth replacing with what actually happened.
+            if self._alpide_failed in (None, 'not started'):
+                self._alpide_failed = 'launch failed, no trigger started'
+
+    def _alpide_start(self, hz):
+        """Start recording for this run, arming regardless of how it goes.
+
+        If LAUNCH already brought EUDAQ2 up, only the trigger is left and data
+        begins at pulse 0. Otherwise this still does the whole bring-up itself,
+        exactly as before — ALPIDE is additive and must never be a precondition
+        for gating the beam, so skipping LAUNCH has to keep working.
+        """
+        if self._daq_ready:
+            threading.Thread(
+                target=lambda: self._alpide_run_trigger(hz), daemon=True).start()
+            return
+        if self._alpide_pid is not None:
+            # A LAUNCH is still coming up. Hand the rate to that worker so it
+            # starts the trigger the instant the run is RUNNING, rather than
+            # returning — returning here skipped T1 for the whole run, leaving
+            # the pulse counter at zero and every transition unusable. Measured
+            # once for real, on a run that otherwise looked completely normal.
+            #
+            # START is deliberately still allowed during a launch: the beam arms
+            # immediately either way, and the three-second START/Beam On rule
+            # matters more than the detector.
+            self._pending_start_hz = hz
+            self._alpide_note('รอ DAQ ขึ้นก่อนเริ่ม trigger…')
+            return
+        self._alpide_open_dir()
+
         def _work():
             try:
-                state = alpide_daq.session_state()
-                if state == 'running':
-                    # genuinely acquiring — the ITS3 session and the six boards
-                    # are machine-wide, and racing KCMH-Tricker would corrupt
-                    # both runs
-                    self._alpide_note('ITS3 กำลังใช้งานอยู่ — ไม่ได้บันทึก')
-                    self._alpide_failed = 'ITS3 session busy'
-                    return
-                if state == 'stale':
-                    self._alpide_note('เก็บกวาด ITS3 session ที่ค้างอยู่')
-                    alpide_daq.kill_session()
-                    time.sleep(2)
-                bstate, msg = alpide_daq.status()
-                if bstate != 'ready':
-                    self._alpide_note(f'ไม่ได้บันทึก ({msg})')
-                    self._alpide_failed = msg
-                    return
-                pid = alpide_daq.start_run(self._alpide_dir)
-                self._alpide_pid = pid
-                self._alpide_note('acquisition starting…')
-                if not alpide_daq.wait_for_running():
-                    self._alpide_note('run ไม่ขึ้นสถานะ RUNNING — ดู rc.log')
-                    self._alpide_failed = 'never reached RUNNING'
-                    return
-                self._trigger_on(hz)      # defines pulse 0 == first trigN
-                if alpide_daq.wait_for_data(self._alpide_dir):
-                    self._alpide_note(f'recording @ {hz} Hz')
-                else:
-                    self._alpide_note('running but no data — check rc.log')
-                self._alpide_failed = None
+                if self._alpide_bring_up():
+                    self._alpide_run_trigger(hz)
             except Exception as e:
                 self._alpide_note(f'start failed: {type(e).__name__}: {e}')
                 self._alpide_failed = f'{type(e).__name__}: {e}'
@@ -1400,6 +1924,14 @@ class EyeTrackingApp:
     def _alpide_stop(self):
         pid, self._alpide_pid = self._alpide_pid, None
         self._close_ev_log()
+        # Before the early return below, not after: a run that never started is
+        # exactly the case where the log is worth having. Resolved here rather
+        # than inside the thread because stop() clears _session_root as soon as
+        # this returns — and only when a run actually opened a folder, since
+        # _session_dir() would otherwise create one, leaving an empty session
+        # behind every time the app is closed.
+        if self._session_root:
+            self._save_its3_log(self._session_dir('debug'))
         if pid is None:
             return
         self._alpide_note('stopping acquisition…')
@@ -1437,6 +1969,16 @@ class EyeTrackingApp:
 
     def _on_arduino_line(self, line):
         """Called from the serial reader thread — keep it short and non-blocking."""
+        if line == 'READY':
+            # The board only prints this in setup(), so seeing it after we are
+            # already up means it reset — a power blip, a knocked USB lead. It
+            # comes back with the relays dropped and the trigger stopped, and
+            # nothing else tells us: the app would keep showing READY and BEAM
+            # ACTIVE, keep logging transitions, and produce a run whose pulse
+            # counts are all zero. Marshalled to the UI thread because this runs
+            # on the serial reader.
+            self.root.after(0, self._on_arduino_reset)
+            return
         if not line.startswith('EV '):
             print(f'[Arduino] {line}')
             return
@@ -1454,6 +1996,34 @@ class EyeTrackingApp:
                 self._ev_log.flush()
             except Exception:
                 pass
+
+    def _on_arduino_reset(self):
+        """The board restarted underneath us. UI thread.
+
+        Its relays are already in the safe state — that is what a reset does —
+        so nothing has to be cut here. What does have to happen is that the app
+        stops claiming a state the board no longer holds: Enable is down, the
+        trigger is stopped, and the pulse counter that ties the beam log to the
+        detector data has gone back to zero, so the rest of this run cannot be
+        matched against the .raw whatever else happens.
+        """
+        if not (self.ready or (self.capture and self.capture.armed)):
+            return                       # the ordinary banner at connect time
+        print('[Arduino] board reset mid-session — dropping to UNREADY')
+        self._alpide_failed = 'Arduino reset mid-run (pulse counter lost)'
+        if self.capture and self.capture.armed:
+            self.stop()
+        self.ready = False
+        self.arduino.send(b'E0\n')       # match our state to the board's
+        self._release_kill()
+        self._set_launch_state('locked')
+        self._alpide_note('Arduino รีเซ็ต — กด READY ใหม่')
+        messagebox.showwarning(
+            "Arduino reset",
+            "บอร์ดรีสตาร์ทระหว่างใช้งาน (ไฟตก/สายหลุด)\n\n"
+            "รีเลย์ตกสู่สถานะปลอดภัยแล้ว และตัวนับพัลส์ถูกล้าง — "
+            "ข้อมูลของ run นี้เทียบเวลากับ ALPIDE ไม่ได้\n\n"
+            "กด READY ใหม่ก่อนเริ่ม run ถัดไป")
 
     # ── Watchdog heartbeat ─────────────────────────
     # The Arduino drops both relays if it hears nothing for WATCHDOG_MS (see
@@ -1486,12 +2056,15 @@ class EyeTrackingApp:
     # ── Close ──────────────────────────────────────
 
     def on_close(self):
+        # Disarm before the relay commands, for the same reason as stop(): an
+        # armed capture loop re-states its decision periodically and would
+        # otherwise race the B0 below.
+        if self.capture:
+            self.capture.armed = False
         self.arduino.send(b'B0\n')
         self.arduino.send(b'T0\n')
         self.arduino.send(b'E0\n')
         self._alpide_stop()
-        if self.capture:
-            self.capture.armed = False
         self._teardown_capture()
         self.arduino.close()
         self.root.destroy()

@@ -105,6 +105,17 @@ class CaptureThread:
         self._cut_dropped = 0
         self._cut_saved   = 0
 
+        # Per-frame log for the whole armed window — every frame, not only the
+        # ones a beam transition happens on. Written directly from this thread
+        # (unlike cuts/, no queue+writer thread): there is no JPEG encode here,
+        # just a short line, so the loop can afford to do it itself. See
+        # start_track_log.
+        self._track_file = None
+        self._track_writer = None
+        self._track_frame_idx = 0
+        self._track_flush_every = 30    # ≈1 s at 30 fps; worst-case loss on a
+                                        # crash, not a cost paid every frame
+
     # ── Public API (main thread only) ─────────────────────────
 
     def start(self):
@@ -149,6 +160,90 @@ class CaptureThread:
             self._rec_frame_idx = 0
             self._recording = True
 
+    def start_track_log(self, folder):
+        """Write output/session_<ts>/track.csv for the whole armed window: one
+        row per frame, not only the ones a beam transition happens on.
+
+        This is the only record of where the eye was and how long deciding
+        took on a run that never has protons flying through it and never will
+        until this file exists — cuts.csv only fires on a beam-off transition,
+        which says nothing about the run's steady state or how close a near
+        miss came. See _gate_reason for how the `reason` column is derived
+        without touching _gate_open itself.
+        """
+        self.stop_track_log()
+        try:
+            os.makedirs(folder, exist_ok=True)
+            self._track_file = open(os.path.join(folder, 'track.csv'), 'w', newline='')
+            self._track_writer = csv.writer(self._track_file)
+            self._track_writer.writerow([
+                'frame', 'host_time_iso', 't_capture', 't_decided',
+                'deviation_mm', 'iris_px', 'detect', 'gate', 'beam_state',
+                'reason'])
+        except Exception:
+            self._track_file = None
+            self._track_writer = None
+        self._track_frame_idx = 0
+
+    def stop_track_log(self):
+        f, self._track_file = self._track_file, None
+        self._track_writer = None
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    def _gate_reason(self, trigger, gate_open):
+        """Why the gate is or isn't open this frame, for track.csv only.
+
+        Derived from the same inputs _gate_open already used, never from a
+        second read of live state — this must not become a second place the
+        beam decision is made. Empty string when the gate is open.
+        """
+        if gate_open:
+            return ''
+        if not self.armed:
+            return 'unarmed'
+        if self.kill_latched:
+            return 'kill'
+        if trigger is None:
+            return 'no_face'
+        if trigger is False:
+            return 'blink' if self._last_deviation_mm is None else 'deviation'
+        # trigger is True but the gate is still shut: only the min-off hold
+        # can do that (see _gate_open) — anything else here would mean the two
+        # methods have drifted apart.
+        return 'hold'
+
+    def _write_track_row(self, t_capture, trigger, armed_trigger):
+        """Append one row to track.csv, if logging is on. Called from the
+        detection loop every frame, so — like _queue_cut — it must never do
+        real work: no encode, no I/O beyond a buffered write, flushed only
+        every _track_flush_every rows. t_decided is stamped here, which is
+        after any relay command for this frame has already gone out, so the
+        row describes what just happened rather than predicting it.
+        """
+        if self._track_writer is None:
+            return
+        t_decided = time.monotonic()
+        try:
+            self._track_writer.writerow([
+                self._track_frame_idx, datetime.now().isoformat(),
+                f'{t_capture:.6f}', f'{t_decided:.6f}',
+                '' if self._last_deviation_mm is None
+                    else f'{self._last_deviation_mm:.4f}',
+                '' if self._last_iris_px is None
+                    else f'{self._last_iris_px:.2f}',
+                '' if trigger is None else int(trigger),
+                int(armed_trigger), self.current_state,
+                self._gate_reason(trigger, armed_trigger)])
+            self._track_frame_idx += 1
+            if self._track_frame_idx % self._track_flush_every == 0:
+                self._track_file.flush()
+        except Exception:
+            pass
+
     def start_cut_capture(self, folder):
         """Save the screen at every beam-off transition into `folder`.
 
@@ -173,7 +268,7 @@ class CaptureThread:
         if t is not None:
             t.join(timeout=3.0)
 
-    def _queue_cut(self, frame, trigger):
+    def _queue_cut(self, frame, trigger, gate_open):
         """Hand one frame to the writer. Called from the detection loop, so it
         must never block: a full queue drops the frame instead of stalling the
         decision that turns the beam off.
@@ -184,20 +279,26 @@ class CaptureThread:
         array. Copying it here measured 4.4 ms of the detection loop's budget
         for no benefit; if anything downstream ever starts drawing into the
         displayed frame, this needs a copy again.
+
+        `gate_open` (this frame's `_gate_open()` result — always False here,
+        since this only fires on an on-to-off transition) goes to
+        `_gate_reason()` for the label. A real run caught the bug in reasoning
+        from trigger/deviation alone: STOP disarms mid-run while the eye
+        happens to be on target, and the cut this fires for got labelled
+        'deviation' with deviation_mm well under threshold — the beam went off
+        because armed became False, nothing to do with the eye. _gate_reason()
+        checks armed and kill_latched first, the same order _gate_open() does,
+        so this and track.csv's `reason` column can never disagree again.
         """
         q = self._cut_queue
         if q is None:
             return
-        if self._last_deviation_mm is None:
-            reason = 'no_face' if trigger is None else 'blink'
-        else:
-            reason = 'no_face' if trigger is None else 'deviation'
         meta = {
             'iso':       datetime.now().isoformat(),
             'monotonic': time.monotonic(),
             'deviation': self._last_deviation_mm,
             'threshold': self.params.get('threshold_mm', config.DEFAULT_THRESHOLD_MM),
-            'reason':    reason,
+            'reason':    self._gate_reason(trigger, gate_open),
         }
         try:
             q.put_nowait((frame, meta))
@@ -306,6 +407,12 @@ class CaptureThread:
 
                 t0 = time.time()
                 ret, frame = self.cap.read()
+                # The moment the frame is actually in hand — start of the part
+                # of the latency chain a track.csv row can measure. Everything
+                # before this (sensor exposure, USB transfer) never reaches
+                # software and needs a hardware timestamp (an LED the Arduino
+                # lights and stamps itself) to measure at all — see next.md.
+                t_capture = time.monotonic()
 
                 if not ret:
                     if self.is_video and self.params.get('loop', True):
@@ -369,7 +476,7 @@ class CaptureThread:
                     # evidence about the beam cut, not part of causing it. Only
                     # on the transition — the periodic refresh below re-states a
                     # decision that already happened.
-                    self._queue_cut(frame, trigger)
+                    self._queue_cut(frame, trigger, armed_trigger)
                 elif self._frame_idx % self._BEAM_REFRESH_N == 0:
                     # Re-state the unchanged decision periodically. On-change
                     # alone can go silent for minutes while the eye holds still,
@@ -378,6 +485,12 @@ class CaptureThread:
                     # the current decision instead of leaving it stale.
                     self.arduino.send(b'B1\n' if armed_trigger else b'B0\n')
 
+                # t_decided is stamped here, after any relay command for this
+                # frame has already been sent — the row describes what just
+                # happened, the same rule _queue_cut follows for cuts.csv.
+                # t_decided - t_capture is the whole detect+decide cost per
+                # frame, still on the clock the beam commands were sent on.
+                self._write_track_row(t_capture, trigger, armed_trigger)
 
                 if self.is_video and self._total > 0 and self._seek < 0:
                     cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))

@@ -33,6 +33,7 @@ import glob
 import json
 import os
 import sys
+import traceback
 
 import numpy as np
 
@@ -287,6 +288,10 @@ def read_beam_events(folder):
     a number that looks perfectly reasonable and means nothing.
     """
     path = os.path.join(folder, 'alpide', 'beam_events.csv')
+    if not os.path.exists(path):
+        raise SystemExit('no beam_events.csv in %s — START was never pressed, '
+                         'or the run was cancelled before it got that far'
+                         % os.path.join(folder, 'alpide'))
     out, skipped = [], 0
     with open(path) as f:
         reader = csv.DictReader(f)
@@ -500,6 +505,18 @@ def report_levels(run, levels, used):
     print('  planes used         : %s' % (used if used else 'none'))
 
 
+def _event_latency_stats(rows, ev):
+    """(values, dropped_count) for one event kind ('B0' or 'B1'), or (None, n)
+    if nothing was measurable. Shared by report_transitions (printing) and the
+    analysis.json / latency-budget writers, so the two can never disagree
+    about which rows counted."""
+    vals = [r['latency'] for r in rows if r['event'] == ev
+            and r['latency'] is not None and not r['already']]
+    dropped = sum(1 for r in rows if r['event'] == ev
+                  and (r['latency'] is None or r['already']))
+    return (np.array(vals) if vals else None), dropped
+
+
 def report_transitions(rows, ms_per_trig):
     print('── transitions ' + '─' * 50)
     print('  %-4s %8s %8s %10s %10s %10s  %s'
@@ -513,17 +530,13 @@ def report_transitions(rows, ms_per_trig):
 
     for ev, label in (('B0', 'beam off (the safety-critical one)'),
                       ('B1', 'beam on')):
-        vals = [r['latency'] for r in rows if r['event'] == ev
-                and r['latency'] is not None and not r['already']]
-        dropped = sum(1 for r in rows if r['event'] == ev
-                      and (r['latency'] is None or r['already']))
+        a, dropped = _event_latency_stats(rows, ev)
         print('── %s: %s ' % (ev, label) + '─' * max(0, 45 - len(label)))
         if dropped:
             print('  %d transition(s) excluded, see the notes above' % dropped)
-        if not vals:
+        if a is None:
             print('  no measurable transitions')
             continue
-        a = np.array(vals)
         print('  n %d   mean %.1f ms   median %.1f ms   min %.1f   max %.1f'
               % (a.size, a.mean(), np.median(a), a.min(), a.max()))
         print('  (resolution is one trigger = %.1f ms)' % ms_per_trig)
@@ -549,25 +562,200 @@ def write_csv(folder, rows, ms_per_trig):
     return path
 
 
+# ── Latency budget: the other half of the chain ──────────────────────────────
+# analyze_latency's transitions are the command-to-protons-stopped leg, timed
+# on the pulse count — the tight half. track.csv (capture.py) adds the other
+# half that used to have no record at all: how long detection and the gate
+# decision take on this side of the serial link, per frame, on the same
+# monotonic clock. Still missing is [1]→[3] — sensor exposure and the USB
+# transfer, before any of this code ever sees a frame — which needs a hardware
+# timestamp (an LED the Arduino lights and stamps itself) to measure at all.
+
+def compute_budget(folder):
+    """The track.csv half of the latency budget, as a dict — no printing, so
+    it can be computed once and either reported alone (self-check, no beam
+    signal) or augmented with the ALPIDE-side numbers once `rows` exists,
+    without ever reading the file or printing the section twice.
+
+    None if there is no track.csv to read: an older session, or one where the
+    no-DAQ fallback was armed before this file existed.
+    """
+    path = os.path.join(folder, 'track.csv')
+    if not os.path.exists(path):
+        return None
+    t_cap = []
+    t_dec = []
+    with open(path, newline='') as f:
+        for r in csv.DictReader(f):
+            try:
+                t_cap.append(float(r['t_capture']))
+                t_dec.append(float(r['t_decided']))
+            except (KeyError, ValueError):
+                continue
+    if len(t_cap) < 2:
+        return None
+    t_cap = np.array(t_cap)
+    t_dec = np.array(t_dec)
+    decide_ms = (t_dec - t_cap) * 1000.0
+    period_ms = np.diff(np.sort(t_cap)) * 1000.0
+    # A seek or a loop restart (video mode only) can make consecutive capture
+    # times go backwards or jump by seconds; drop anything outside one frame
+    # at a plausible camera rate rather than let one bad row skew the median.
+    period_ms = period_ms[(period_ms > 0) & (period_ms < 1000)]
+
+    d = {
+        'frames': int(t_cap.size),
+        'detect_decide_ms': {
+            'median': round(float(np.median(decide_ms)), 2),
+            'p95': round(float(np.percentile(decide_ms, 95)), 2),
+            'max': round(float(decide_ms.max()), 2),
+        },
+    }
+    if period_ms.size:
+        d['frame_period_ms'] = {'median': round(float(np.median(period_ms)), 2)}
+    return d
+
+
+def report_budget(budget, meta):
+    """Print the base latency-budget section (the half computed from
+    track.csv alone). Call once; see report_budget_closing_leg for the part
+    that needs `rows`."""
+    print()
+    print('── latency budget ' + '─' * 47)
+    print('  [3]→[5]  detect + decide     : median %6.2f ms   p95 %6.2f ms'
+          % (budget['detect_decide_ms']['median'], budget['detect_decide_ms']['p95']))
+    if 'frame_period_ms' in budget:
+        print('           frame period         : median %6.2f ms'
+              % budget['frame_period_ms']['median'])
+    print('  not yet measured [1]→[3] (camera exposure + USB transfer) — needs')
+    print('  an LED the Arduino lights and stamps itself; see next.md')
+    hold = meta.get('min_off_s')
+    if hold:
+        budget['opening_leg_min_off_s'] = hold
+        print('  opening leg additionally waits min_off_s = %.3g s once the '
+              'beam is cut, before any of the above starts' % hold)
+
+
+def report_budget_closing_leg(budget, rows):
+    """Append the command→beam-off/on figures once `rows` exists (i.e. only
+    on the path that reached measure()). Mutates and returns `budget` so the
+    caller's analysis.json copy picks up the new fields too."""
+    close_vals, _ = _event_latency_stats(rows, 'B0')
+    if close_vals is not None:
+        close_ms = round(float(np.median(close_vals)), 1)
+        budget['command_to_beam_off_ms'] = close_ms
+        total = round(budget['detect_decide_ms']['median'] + close_ms, 1)
+        budget['total_close_leg_ms'] = total
+        print('  [5]→[6]  command → beam off  : median %6.1f ms  '
+              '(safety-critical leg)' % close_ms)
+        print('  ' + '─' * 60)
+        print('  measured total, closing leg  : %6.1f ms' % total)
+    open_vals, _ = _event_latency_stats(rows, 'B1')
+    if open_vals is not None:
+        budget['command_to_beam_on_ms'] = round(float(np.median(open_vals)), 1)
+    return budget
+
+
+def health_summary(run, meta, events, skipped, n_trig, hz):
+    """The same facts report_health() prints, as a dict — kept as a separate
+    read of the same inputs rather than parsed out of the printed text, so a
+    wording change to the report can never silently break analysis.json."""
+    observed = int(np.count_nonzero(~np.isnan(run.hits[:, 0])))
+    d = {
+        'n_events':            run.n_events,
+        'n_blocks':            run.n_blocks,
+        'planes':              list(run.planes),
+        'decode_errors':       dict(run.errors),
+        'other_event_types':   dict(run.other_events),
+        'planes_out_of_step':  run.plane_disagree,
+        'planes_out_of_step_pct': round(
+            100.0 * run.plane_disagree / max(run.n_events, 1), 2),
+        'trig_mismatch':       run.trig_mismatch,
+        'n_trig':              n_trig,
+        'trig_present':        observed,
+        'trig_missing':        n_trig - observed,
+        'beam_events_usable':  len(events),
+        'beam_events_skipped': skipped,
+        'hits_per_trigger':    {
+            'p%d' % dev: round(float(np.nanmean(run.hits[:, j])), 4)
+            for j, dev in enumerate(run.planes)},
+    }
+    have = np.nonzero(run.ts_ps)[0]
+    if have.size > 1:
+        dt_us = np.diff(run.ts_ps[have]) / np.diff(have) / 1e6
+        d['trigger_period_us'] = {
+            'min': round(float(dt_us.min()), 1),
+            'median': round(float(np.median(dt_us)), 1),
+            'max': round(float(dt_us.max()), 1),
+            'expected': round(1e6 / hz, 1),
+        }
+    return d
+
+
+class _Tee:
+    """Duplicates writes to the real stream and to an in-memory buffer, so the
+    operator still sees progress live while main() also gets the full text to
+    put in report.txt afterwards."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buf = []
+
+    def write(self, s):
+        self._stream.write(s)
+        self._buf.append(s)
+
+    def flush(self):
+        self._stream.flush()
+
+    def getvalue(self):
+        return ''.join(self._buf)
+
+
+def write_report(folder, text):
+    path = os.path.join(folder, 'report.txt')
+    with open(path, 'w') as f:
+        f.write(text)
+    return path
+
+
+def _json_default(o):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    return str(o)
+
+
+def write_analysis_json(folder, analysis):
+    path = os.path.join(folder, 'analysis.json')
+    with open(path, 'w') as f:
+        json.dump(analysis, f, indent=2, default=_json_default)
+    return path
+    return path
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('session', nargs='?', default=None,
-                    help='session folder, or a folder of them (default: newest '
-                         'in %s)' % config.OUTPUT_DIR)
-    ap.add_argument('--self-check', action='store_true',
-                    help='report data health only, without measuring latency')
-    ap.add_argument('--quiet', action='store_true', help='no progress output')
-    args = ap.parse_args(argv)
-
+def _run(args, analysis):
+    """Does the actual work; main() wraps this so report.txt and
+    analysis.json get written whichever way it exits — including the early
+    SystemExit('...') paths below, which is why each one sets a verdict on
+    `analysis` immediately before raising rather than leaving the caller to
+    infer one from the exception text."""
     folder = find_session(args.session)
+    analysis['folder'] = folder
     print('session: %s' % folder)
     meta = read_session(folder)
+    analysis['meta'] = {k: meta.get(k) for k in
+                        ('trigger_hz', 'trigger_duty', 'threshold_mm',
+                         'min_off_s', 'started', 'stopped', 'ended',
+                         'beam_on_s')}
     events, skipped = read_beam_events(folder)
 
     raws = sorted(glob.glob(os.path.join(folder, 'alpide', '*.raw')))
     if not raws:
+        analysis['verdict'] = 'no_raw_file'
         raise SystemExit('no .raw file in %s — the run produced no detector '
                          'data at all, which the rest of the session folder '
                          'does not show' % os.path.join(folder, 'alpide'))
@@ -575,6 +763,7 @@ def main(argv=None):
         print('warning: %d raw files, using %s' % (len(raws), os.path.basename(raws[-1])))
     run = read_raw(raws[-1], progress=not args.quiet)
     if run.hits is None:
+        analysis['verdict'] = 'no_decodable_data'
         raise SystemExit('no decodable ALPIDE data in %s' % raws[-1])
 
     n_trig = run.hits.shape[0]
@@ -582,10 +771,22 @@ def main(argv=None):
     ms_per_trig = 1000.0 / hz
 
     report_health(run, meta, events, skipped, n_trig)
+    analysis['health'] = health_summary(run, meta, events, skipped, n_trig, hz)
+    # Independent of whether this run has any beam signal at all: it is a
+    # measurement of this app's own performance, not of the .raw. Computed
+    # once here; report_budget_closing_leg augments the same dict later if
+    # `rows` ends up existing, rather than this being read or printed twice.
+    budget = compute_budget(folder)
+    if budget:
+        report_budget(budget, meta)
+        analysis['latency_budget'] = budget
+
     if args.self_check:
+        analysis['verdict'] = 'self_check'
         return 0
 
     if not events:
+        analysis['verdict'] = 'no_transitions'
         raise SystemExit('no beam transitions with trig_running=1 — nothing to '
                          'measure against')
 
@@ -593,6 +794,11 @@ def main(argv=None):
     levels = plane_levels(run.hits, intervals)
     used = [dev for j, dev in enumerate(run.planes) if levels[j][3]]
     report_levels(run, levels, used)
+    analysis['levels'] = {
+        'p%d' % dev: {'noise': round(nm, 3), 'noise_sd': round(ns, 3),
+                     'beam': round(bm, 3), 'used': bool(usable)}
+        for dev, (nm, ns, bm, usable) in zip(run.planes, levels)}
+    analysis['planes_used'] = used
 
     if not used:
         print()
@@ -605,9 +811,11 @@ def main(argv=None):
                   'DAQ synchronisation problem,')
             print('not a statement about protons. Fix the sync before reading '
                   'anything into this run.')
+            analysis['verdict'] = 'daq_sync_problem'
         else:
             print('Expected for a run taken without protons — every frame is '
                   'noise, so there is no drop to time.')
+            analysis['verdict'] = 'no_beam_signal'
         return 2
 
     cols = [j for j, dev in enumerate(run.planes) if levels[j][3]]
@@ -619,9 +827,93 @@ def main(argv=None):
 
     rows = measure(signal, events, noise, beam, n_trig, ms_per_trig)
     report_transitions(rows, ms_per_trig)
+    analysis['transitions'] = {
+        ev: (lambda a, dropped: {'n': int(a.size), 'mean_ms': round(float(a.mean()), 1),
+                                 'median_ms': round(float(np.median(a)), 1),
+                                 'min_ms': round(float(a.min()), 1),
+                                 'max_ms': round(float(a.max()), 1),
+                                 'excluded': dropped}
+                    if a is not None else {'n': 0, 'excluded': dropped})(
+            *_event_latency_stats(rows, ev))
+        for ev in ('B0', 'B1')}
+    # `rows` exists now, so the closing-leg total (detect+decide plus
+    # command-to-beam-off) can be appended to the section already printed
+    # above — nothing gets printed twice.
+    if budget:
+        report_budget_closing_leg(budget, rows)
+        analysis['latency_budget'] = budget
+    analysis['verdict'] = 'ok'
+
     print()
     print('wrote %s' % write_csv(folder, rows, ms_per_trig))
     return 0
+
+
+def _write_outputs(analysis, tee):
+    """report.txt + analysis.json, if a session folder was ever identified —
+    called from every exit path in main() so a session folder explains itself
+    even when analyze_latency.py itself is what went wrong."""
+    folder = analysis.get('folder')
+    if not folder:
+        return
+    try:
+        print('wrote %s' % write_report(folder, tee.getvalue()))
+    except Exception as e:
+        print('warning: could not write report.txt: %s' % e, file=sys.stderr)
+    try:
+        write_analysis_json(folder, analysis)
+    except Exception as e:
+        print('warning: could not write analysis.json: %s' % e, file=sys.stderr)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('session', nargs='?', default=None,
+                    help='session folder, or a folder of them (default: newest '
+                         'in %s)' % config.OUTPUT_DIR)
+    ap.add_argument('--self-check', action='store_true',
+                    help='report data health only, without measuring latency')
+    ap.add_argument('--quiet', action='store_true', help='no progress output')
+    args = ap.parse_args(argv)
+
+    analysis = {}
+    real_stdout = sys.stdout
+    tee = _Tee(real_stdout)
+    sys.stdout = tee
+    try:
+        try:
+            code = _run(args, analysis)
+        except SystemExit as e:
+            # find_session() can also raise before any folder is known — in
+            # that case there is nowhere to write outputs, same as before this
+            # existed, so only print here and let the message reach stderr as
+            # it always did.
+            if isinstance(e.code, str):
+                print(e.code)
+                analysis.setdefault('verdict', 'error')
+                analysis['error'] = e.code
+                code = 1
+            else:
+                raise
+        except Exception:
+            # Anything unforeseen still gets a report rather than vanishing
+            # into a bare traceback with nothing on disk — the whole point of
+            # this file is that a session folder explains itself, including
+            # when this script is what went wrong. Re-raised after writing so
+            # the traceback still reaches stderr and the exit code stays
+            # nonzero, same as before this existed.
+            tb = traceback.format_exc()
+            print(tb)
+            analysis.setdefault('verdict', 'error')
+            analysis['error'] = tb
+            sys.stdout = real_stdout
+            _write_outputs(analysis, tee)
+            raise
+    finally:
+        sys.stdout = real_stdout
+
+    _write_outputs(analysis, tee)
+    return code
 
 
 if __name__ == '__main__':

@@ -1,8 +1,54 @@
 # Next session
 
-## สถานะ (อัปเดต 2026-08-18)
+## สถานะ (อัปเดต 2026-08-19)
 
 รายละเอียดการออกแบบทั้งหมดอยู่ใน **README.md** (DB9 wiring, watchdog, ALPIDE, การวิเคราะห์ latency) ไฟล์นี้เก็บเฉพาะ**สิ่งที่ต้องรู้ก่อนลงมือรอบหน้า**
+
+---
+
+## สิ่งที่เพิ่มเข้ามารอบสามของวันที่ 2026-08-19 — session folder อธิบายตัวเองได้ + เริ่มวัด latency ฝั่งแอป
+
+จุดเริ่ม: ถามว่า "ตาหลุด → กี่ ms กว่าจะส่งสัญญาณบอกว่าบีมหยุด" ไล่โค้ดแล้วพบว่า **`analyze_latency.py` วัดแค่ครึ่งหลังของโซ่** (Arduino รับคำสั่ง → โปรตอนหยุด) ส่วนครึ่งแรก (ตาขยับ → Arduino รับคำสั่ง) ไม่มีข้อมูลใดคำนวณย้อนหลังได้เลย ทั้งที่โค้ดบันทึกเองว่าเคยวัดได้ 27 fps จากกล้องที่อ้าง 50 — เทอมนี้น่าจะใหญ่กว่าที่กำลังวัดอย่างพิถีพิถันอยู่ด้วยซ้ำ
+
+- **`track.csv`** ใหม่ทั้งไฟล์ — log ทุกเฟรมตลอดช่วง armed (`t_capture`, `t_decided`, deviation, gate, reason) `t_decided - t_capture` คือ latency ฝั่งแอปต่อเฟรม (detect+decide) ที่ไม่เคยมีตัวเลขนี้มาก่อน เขียนตรงจาก loop ไม่ผ่าน queue+thread (มีเทสต์วัดต้นทุนต่อแถวว่า < 0.5 ms) เพิ่ม `_gate_reason()` แยกจาก `_gate_open()` **ไม่แตะของเดิมเลย**
+- **`debug/app.log`** — `launch.sh` ไม่ redirect stdout เปิดจาก desktop icon แล้ว `[ALPIDE]`/`[BEAM]`/`[Arduino]` หายหมด ตอนนี้ `self.log()` แทน `print()` ทุกจุด บัฟเฟอร์ไว้ตั้งแต่ก่อนมี session folder (ring buffer 2000 บรรทัด) แล้วดัมพ์ลงไฟล์ตอนโฟลเดอร์ถูกสร้าง
+- **`analyze_latency.py` รันให้เองหลัง STOP** เป็น subprocess บน worker thread ที่ `stop_run()` เพิ่งคืนค่ามา เขียน **`report.txt`** (ข้อความที่เคยพิมพ์ออกจอ) + **`analysis.json`** (ตัวเลขอ่านด้วยโปรแกรมได้ + `verdict`) **ทุกครั้งไม่ว่าจะจบทางไหน** รวมถึงตอน exception ที่ไม่คาดคิด — ระหว่างทางเจอบั๊กจริง: `read_beam_events()` crash ด้วย `FileNotFoundError` ดิบๆ ถ้าไม่มี `beam_events.csv` (run ที่ launch แล้วไม่ START) ตอนนี้แปลงเป็น `SystemExit` ที่มีข้อความแล้ว
+- **ส่วน "latency budget"** ใน report — อ่าน `track.csv` มาบวกกับ `[5]→[6]` ที่วัดจาก `.raw` อยู่แล้ว ได้ตัวเลข closing-leg รวม (`total_close_leg_ms`) เป็นครั้งแรก
+- **`session.json` เพิ่ม provenance + `ended`** — `git_commit`/`git_dirty`/`hostname`/`camera.achieved_fps`/`frames`/`beam_transitions`/`cuts_saved`/`cuts_dropped` และ `ended` (`stop`/`enable_off`/`arduino_reset`/`app_closed`) — เดิม run ที่แอปตายกลางคันหน้าตาเหมือน run ปกติ
+
+**ทดสอบกับของจริงแล้วในเซสชันเดียวกัน (มี Arduino + กล้องจริง ไม่มีบีม)** — `session_20260819_153242` และ `session_20260819_154058` ยืนยันว่าทุกไฟล์ join กันได้จริง (`track.csv` เทียบ `cuts.csv` ตรงเป๊ะทุกแถว ทั้ง `reason` และ `deviation_mm`), `latency_budget` ออกมาสมเหตุสมผลครั้งแรก (`detect+decide` median ~18 ms, `frame period` median ~35 ms ↔ `achieved_fps` ~27-28 ตรงกันสองทาง), `verdict: no_beam_signal` ถูกต้องเพราะไม่มีโปรตอน — **ระหว่างตรวจเจอบั๊กจริง 2 ตัว แก้ไปแล้วทั้งคู่:**
+
+  1. **`[ANALYZE]` หายจาก `debug/app.log`** — `_auto_analyze()` รันบน background thread หลัง `stop()` ปิด `app.log` handle ของ session นั้นไปแล้ว (ต้องรอ `eudaq.stop()` sleep ~6 วิ) เขียนไม่ทัน handle เลยถูกปิดไปก่อน หรือแย่กว่านั้นคือไปเขียนใส่ session ถัดไปผิดไฟล์ แก้ด้วย `log_to_folder()` เขียนตรงไปที่ path ของโฟลเดอร์นั้นเลย ไม่ผ่าน handle ที่ใช้ร่วมกัน (`session_20260819_154058` ยืนยันว่าแก้แล้วเห็น `[ANALYZE] exit 2, verdict=no_beam_signal` ใน app.log จริง)
+  2. **`cuts.csv` ติดป้าย `reason` ผิดตอนบีมดับเพราะ disarm ไม่ใช่ตา** — `_queue_cut()` เดิมดู `trigger`/`deviation` อย่างเดียว ไม่เช็ค `armed`/`kill_latched` เลย ของจริงจับได้ที่ `cut_0007.jpg` ของ `session_20260819_154058`: กด STOP ตอนตาอยู่บนเป้าพอดี (`deviation_mm=0.6875` ต่ำกว่า threshold 6.0 มาก) แต่ CSV บอก `reason=deviation` ทั้งที่ `track.csv` เฟรมเดียวกันบอกถูกว่า `unarmed` แก้ด้วยการรวม `_queue_cut()` ให้เรียก `_gate_reason()` ตัวเดียวกับ `track.csv` (เพิ่มพารามิเตอร์ `gate_open`) ตอนนี้สองไฟล์ขัดกันไม่ได้อีกแล้ว มีเทสต์ `test_reason_is_why_the_beam_actually_went_off` คุมไว้
+
+**ยังไม่ได้ทำ — ต้องมีฮาร์ดแวร์:** `[1]→[3]` (sensor exposure + USB transfer ก่อนซอฟต์แวร์เห็นเฟรม) วัดจากซอฟต์แวร์ไม่ได้เลย วิธีที่ถูกที่สุดคือ **LED ในเฟรมกล้อง**: ให้ Arduino ติด LED เองพร้อมประทับ pulse count (เหมือน `beam_events.csv`) แล้วให้แอปตรวจจับ LED ในเฟรม + ประทับเวลาแบบเดียวกับ `t_capture` — ผลต่างคือ [1]→[3] ทั้งก้อน ด้วยนาฬิกาเดียวกับที่ใช้อยู่แล้ว ไม่ต้องสมมติอะไรเพิ่ม ต้องต่อ LED จริงและแก้ firmware เพิ่ม รอบหน้าค่อยทำ
+
+---
+
+## สิ่งที่เพิ่มเข้ามาวันที่ 2026-08-19
+
+มาจากการนั่งเทียบ flow กับ Kcmh-Tricker ทีละปุ่ม
+
+- **แก้บั๊ก: LAUNCH ครั้งที่สองไม่ทำอะไรเลยเงียบๆ** — run ที่ launch แล้วไม่ได้ start ไม่มีทางถอย (STOP กดได้เฉพาะตอน armed, UNREADY เรียก `stop()` เฉพาะเมื่อ armed) `_alpide_pid` จึงค้าง และ `_launch_daq()` เช็คตัวนี้เป็นเงื่อนไขแรกแล้ว `return` **ปุ่มสว่างเป็นขั้นที่ต้องกดแต่กดแล้วไม่เกิดอะไร** อาการเดียวกับซาก tmux ที่เคยเสีย run 59 วินาที ตอนนี้ UNREADY เรียก `_daq_teardown()` เสมอ
+- **ปุ่ม CANCEL DAQ** (= `Cancel` ของเขา) โผล่เฉพาะตอนมีอะไรให้ยกเลิก **ไม่แตะฝั่งบีมเลยแม้แต่บรรทัดเดียว** — เทสต์ assert ว่าไม่มีอะไรถูกส่งไป Arduino
+- **START กดไม่ได้ระหว่าง `launching`** ขึ้น `waiting for ITS3…` (= `Waiting for ITS3...` ของเขา) + `bell()` ตอนพร้อม **ไม่ขัดกับกฎ 3 วินาที เพราะการรอเกิดที่ LAUNCH ตอนเซ็ตอัพ ไม่ใช่ที่ START** — และมี `_launch_watchdog()` คืนปุ่มให้ที่ 60 วิ ถ้า launch ไม่ตอบเลย detector ห้ามขัง gate
+- **`beam used  N.N s`** ใต้ป้าย BEAM — นับเฉพาะเวลาที่ชัตเตอร์เปิดจริง ลง `session.json` เป็น `beam_on_s` **เวลาบนนาฬิกาไม่ได้บอกว่าใช้บีมไปเท่าไหร่** เพราะเรา gate อยู่
+- แก้ README ตรงที่เคยเขียนว่า run เราไม่มีจุดจบ — **มี คือบีมที่ขอมาต้องยิงให้หมด** ช่วงทดลองขอสั้นๆ 10-20 วินาที แต่จุดจบนั้นเป็นของ TSS (นับ MU) ไม่ใช่ของแอป
+
+**ยังไม่ได้ทำ:** `Load Run` (plan CSV) ยังไม่มีฝั่งเรา และยังไม่มีช่องกรอกว่า "ขอบีมมากี่วินาที" เพื่อให้ `beam used` เทียบกับเป้าได้ — ตอนนี้โชว์ตัวเลขสะสมเฉยๆ
+
+## สิ่งที่เพิ่มเข้ามารอบสองของวันที่ 2026-08-19 — เอา UI ให้ตรง Kcmh-Tricker มากขึ้นอีกขั้น
+
+- **READY → ☑ ENABLE checkbox จริง** ไม่ใช่ปุ่มทาสีให้ดูเหมือน checkbox อีกต่อไป (`_on_enable_toggle`, `self.enable_var`) — tk flip ตัวแปรให้ก่อนเรียก handler เสมอ ดังนั้น precondition ไม่ผ่าน/ยกเลิก dialog ต้อง `.set()` กลับเอง (ไม่ trigger ซ้ำ)
+- **START/STOP/CANCEL DAQ ซ่อนเป็นกลุ่มจนกว่าจะกด LAUNCH DAQ** (`self._run_group`, `show_group` ใน `_refresh_flow`) ตรงกับที่ Kcmh-Tricker ซ่อน Run/Stop/Cancel ไว้จนกด Launch default — **ปุ่มยังไม่หายไปเฉยๆ** มีปุ่มเล็ก **`start without DAQ`** แยกไว้ต่างหากสำหรับตอน ALPIDE ใช้งานไม่ได้ (บอร์ดหาย/flash พัง/tmux ชนกับ Kcmh-Tricker) — ปรึกษาผู้ใช้ก่อนทำเพราะขัดกับกฎที่เขียนไว้ตรงๆ ว่า "ALPIDE ห้ามเป็นเงื่อนไขของการ gate บีม" คำตอบคือซ่อนแถวหลักไว้ตามที่ขอ แต่เก็บทางออกฉุกเฉินแยกไว้ ไม่ลบทิ้ง
+- **เอาปุ่ม PAUSE ออก** — ใช้ได้เฉพาะโหมด Video (debug-only) และ disabled ตลอดในโหมดกล้อง (คลินิก) `pause_event` ยังอยู่ในโค้ด แค่ไม่มี UI ไปเคลียร์มันแล้ว (video playback ยัง seek ได้ด้วย slider)
+- **RECORD → checkbox `Record video (mp4)` ที่ตั้งครั้งเดียว** ไม่ใช่ปุ่มกดทุก run — **LAUNCH DAQ เป็นคนสั่งอัดให้** (`_maybe_auto_record()`) ปุ่ม `start without DAQ` ก็เรียกซ้ำเผื่อข้าม LAUNCH หยุดที่ STOP/CANCEL DAQ เท่านั้น (`_stop_rec()` ตัวเดียว ใช้ร่วมกัน) **เอา popup "Saved" ออก** เพราะตอนนี้มันโผล่ทุก run ไม่ใช่การกดมือนานๆ ครั้ง
+- renumber ปุ่มใน FLOW: `1 LAUNCH DAQ → 2 START → 3 STOP` (ENABLE ไม่มีเลขแล้ว เหมือน checkbox ของ Kcmh-Tricker)
+- เทสต์ใหม่ใน `test_beam_gate.py`: `test_daq_row_visibility` (กลุ่ม/fallback โผล่ถูกจังหวะ), `test_auto_record` (checkbox ไม่ trigger เอง, LAUNCH/fallback trigger, CANCEL หยุดให้)
+
+**ยังไม่ได้ทำ:** ยังไม่ได้ลองบนจอจริง (ทดสอบผ่าน Xvfb + screenshot เท่านั้น) — รอบหน้าควรเปิดแอปจริงเช็ค checkbox/fallback button ให้คลิกง่าย ไม่เล็กเกินไป
+
+**ค้างคาใจ:** `\xFE`/`\xEF` ของ Kcmh-Tricker ถูกใช้สองที่ที่ความหมายดูสวนกัน — MANUAL.txt:148 กับ dialog ตอน disable บอกว่า `\xFE` = หยุดบีม แต่ `ProgressWorker` ส่ง `\xFE` ตอน**เริ่ม** exposure step แล้ว `\xEF` ตอนหมดเวลา อ่านจากโค้ดอย่างเดียวแยกไม่ออก อาจเป็นคนละสายสัญญาณกัน ถ้าถามทีม FPGA ได้ควรถาม (README ของเราตอนนี้อิงการอ่านแบบหลัง)
 
 ---
 
@@ -71,7 +117,7 @@ python3 analyze_latency.py output/session_<ts>
 
 **ที่ยังพิสูจน์ด้วยของจริงไม่ได้จนกว่าจะมีโปรตอน:** ตัวจับจังหวะที่ hit หายไป — ทดสอบด้วยข้อมูลสังเคราะห์ไว้แล้วใน `test_latency.py` (`python3 test_latency.py`)
 
-**เช็ควันมีบีม:** กด LAUNCH DAQ แล้ว**รอแถบจุด 6 planes เขียวครบ**ก่อนกด START ทุกครั้ง จบ run แรกให้รัน `python3 analyze_latency.py <session> --self-check` ทันทีก่อนเก็บ run ต่อไป — ดู `decode errors` ต้องเป็น 0 และ **`planes out of step` ต้องเป็น none**
+**เช็ควันมีบีม:** กด LAUNCH DAQ แล้ว**รอแถบจุด 6 planes เขียวครบ** — ตอนนี้ปุ่ม START กดไม่ได้จนกว่า run จะขึ้นอยู่แล้ว (`waiting for ITS3…`) แต่จุด 6 จุดยังต้องดูเอง เพราะ `wait_for_running()` เช็คแค่ว่า **มี plane ไหนก็ได้** ขึ้น RUNNING (`'RUNNING' in plane_states(...).values()`) ไม่ได้เช็คว่าครบหก จบ run แรกให้รัน `python3 analyze_latency.py <session> --self-check` ทันทีก่อนเก็บ run ต่อไป — ดู `decode errors` ต้องเป็น 0 และ **`planes out of step` ต้องเป็น none**
 
 ### 1a. ⚠️ plane 1 หลุด sync — เกิดๆ หายๆ ยังไม่รู้สาเหตุ
 

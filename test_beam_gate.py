@@ -223,6 +223,12 @@ class _FakeCapture:
     def stop_cut_capture(self):
         self._log.append(('stop_cut_capture', ''))
 
+    def start_track_log(self, folder):
+        self._log.append(('start_track_log', ''))
+
+    def stop_track_log(self):
+        self._log.append(('stop_track_log', ''))
+
     def stop_recording(self):
         self._log.append(('stop_recording', ''))
 
@@ -247,9 +253,9 @@ def test_stop_order():
     app.input_mode.set('camera')
     orig_alpide_stop = app._alpide_stop
 
-    def _traced_alpide_stop():
+    def _traced_alpide_stop(on_stopped=None):
         log.append(('_alpide_stop', ''))
-        orig_alpide_stop()
+        orig_alpide_stop(on_stopped=on_stopped)
     app._alpide_stop = _traced_alpide_stop
 
     app.stop()
@@ -324,6 +330,437 @@ def test_start_during_launch():
     teardown(app, root)
 
 
+# ── undoing a launch ─────────────────────────────────────────────────────────
+
+def _idle_app(root):
+    """An app that is READY with a preview running but nothing armed."""
+    app = build_app(root)
+    log = []
+    app.arduino = _FakeArduino(log)
+    cap = _FakeCapture(log)
+    cap._armed = False              # bypass the setter: no event to record yet
+    app.capture = cap
+    app.input_mode.set('camera')
+    app.ready = True
+    return app, log
+
+
+def _trace_alpide_stop(app, calls):
+    def _traced():
+        calls.append(True)
+        app._alpide_pid = None      # what the real teardown ends up doing
+    app._alpide_stop = _traced
+
+
+def test_unready_tears_down_the_daq():
+    print('\n-- UNREADY after a launch that was never started --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    app, log = _idle_app(root)
+    calls = []
+    _trace_alpide_stop(app, calls)
+    app._alpide_pid = 4242          # LAUNCH brought EUDAQ2 up
+    app._session_root = '/tmp/session_not_written'
+    app._set_launch_state('ready')
+
+    app._on_enable_toggle()         # UNREADY (enable_var defaults False)
+
+    check('the abandoned run is stopped', calls == [True], 'calls %s' % calls)
+    # _launch_daq() returns immediately while this is set, so leaving it behind
+    # made every later LAUNCH a silent no-op with the button lit as the next step
+    check('nothing is left holding the next LAUNCH', app._alpide_pid is None)
+    check('the folder is released too', app._session_root == '')
+    check('Enable still comes down', ('send', 'E0') in log,
+          'sent %s' % [b for a, b in log if a == 'send'])
+    teardown(app, root)
+
+
+def test_cancel_daq():
+    print('\n-- CANCEL DAQ undoes LAUNCH and nothing else --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    app, log = _idle_app(root)
+    calls = []
+    _trace_alpide_stop(app, calls)
+    app._alpide_pid = 4242
+    app._session_root = '/tmp/session_not_written'
+    app._set_launch_state('ready')
+    app._killed = True              # a latch in force must survive this
+    app.capture.kill_latched = True
+
+    app._cancel_daq()
+
+    check('the DAQ is stopped', calls == [True], 'calls %s' % calls)
+    check('the folder is released', app._session_root == '')
+    check('LAUNCH is offered again', app._launch_state == 'idle',
+          'state %r' % app._launch_state)
+    # The whole point of a separate button: it is the detector being cancelled.
+    check('nothing is sent to the Arduino',
+          [b for a, b in log if a == 'send'] == [],
+          'sent %s' % [b for a, b in log if a == 'send'])
+    check('the gate is not touched', ('armed', False) not in log)
+    check('the kill latch survives',
+          app._killed is True and app.capture.kill_latched is True)
+
+    # during a run, STOP is the only thing that ends anything
+    calls.clear()
+    app.capture._armed = True
+    app._alpide_pid = 4243
+    app._cancel_daq()
+    check('refuses while a run is armed',
+          calls == [] and app._alpide_pid == 4243)
+    teardown(app, root)
+
+
+def test_start_waits_for_its3():
+    print('\n-- START is held shut while the DAQ comes up --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    app, _log = _idle_app(root)
+
+    app._set_launch_state('launching')
+    check('START is disabled during the launch',
+          str(app.start_btn['state']) == 'disabled',
+          'state %r' % str(app.start_btn['state']))
+    check('and says what it is waiting for', 'ITS3' in app.start_btn['text'],
+          'text %r' % app.start_btn['text'])
+    check('CANCEL is offered', app._cancel_shown is True)
+
+    app._set_launch_state('ready')
+    check('pressable once the run is up',
+          str(app.start_btn['state']) == 'normal')
+
+    # A launch that fails releases it — the detector must never trap the gate.
+    app._set_launch_state('launching')
+    app._set_launch_state('idle')
+    check('a failed launch gives START back',
+          str(app.start_btn['state']) == 'normal')
+
+    # ...and so does one that simply never answers.
+    app._alpide_pid = None
+    app._set_launch_state('launching')
+    app._launch_watchdog(app._launch_seq - 1)
+    check('a watchdog from an earlier launch is ignored',
+          str(app.start_btn['state']) == 'disabled')
+    app._launch_watchdog(app._launch_seq)
+    check('a wedged launch gives START back',
+          str(app.start_btn['state']) == 'normal')
+    teardown(app, root)
+
+
+# ── the LAUNCH-gated row ─────────────────────────────────────────────────────
+
+def test_daq_row_visibility():
+    print('\n-- START/STOP/CANCEL appear together, only once LAUNCH has happened --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    app, _log = _idle_app(root)
+    app._refresh_flow()   # _idle_app sets app.ready directly, no refresh yet
+
+    check('before LAUNCH: only the no-DAQ fallback is offered',
+          app._group_shown is False and app._fallback_shown is True,
+          'group %s fallback %s' % (app._group_shown, app._fallback_shown))
+
+    app._set_launch_state('launching')
+    check('LAUNCH pressed: the group appears, the fallback steps aside',
+          app._group_shown is True and app._fallback_shown is False)
+
+    app._set_launch_state('ready')
+    check('stays up once the DAQ reports ready', app._group_shown is True)
+
+    app.capture._armed = True
+    app._refresh_flow()
+    check('stays up for the run itself', app._group_shown is True)
+    check('the fallback cannot reappear once a run exists',
+          app._fallback_shown is False)
+
+    app.capture._armed = False
+    app._set_launch_state('idle')
+    check('folds away once both the run and the launch are over',
+          app._group_shown is False)
+    check('the fallback is back for the next setup',
+          app._fallback_shown is True)
+    teardown(app, root)
+
+
+# ── recording tied to LAUNCH, not to a button pressed every run ──────────────
+
+def test_auto_record():
+    print('\n-- the Record checkbox is intent, LAUNCH is the trigger --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    app, _log = _idle_app(root)
+    started = []
+    app._start_rec = lambda: started.append(True)
+
+    app.record_enabled.set(False)
+    app._maybe_auto_record()
+    check('unchecked: nothing starts', started == [])
+
+    app.record_enabled.set(True)
+    app._maybe_auto_record()
+    check('checked: LAUNCH (or the fallback start) starts one',
+          started == [True])
+
+    app.capture._recording = True   # what the real _start_rec would have set
+    app._maybe_auto_record()
+    check('already recording: calling again is a no-op', started == [True])
+
+    stopped = []
+    app._stop_rec = lambda: stopped.append(True)
+    app._alpide_stop = lambda: None
+    app._alpide_pid = 4242
+    app._cancel_daq()
+    check('CANCEL stops a recording it is responsible for', stopped == [True])
+    teardown(app, root)
+
+
+# ── the event log that survives launch.sh not redirecting stdout ─────────────
+
+def test_app_log():
+    print('\n-- debug/app.log gets what happened, including before LAUNCH --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    import config
+    import shutil
+    tmp_out = '/tmp/claude-1000/test_app_log_output'
+    shutil.rmtree(tmp_out, ignore_errors=True)
+    original_out = config.OUTPUT_DIR
+    config.OUTPUT_DIR = tmp_out    # absolute path wins over os.path.join's
+                                   # first argument — see os.path.join docs
+    try:
+        app = build_app(root)
+
+        # Everything that matters before a folder exists — Arduino connect,
+        # a camera failure, a firmware flash — must not be lost just because
+        # nobody had opened a terminal.
+        app.log('[ALPIDE] flashing firmware…')
+        app.log('[Arduino] connected')
+        check('nothing written to disk yet, only buffered',
+              not os.path.isdir(tmp_out))
+
+        folder = app._session_dir()   # what LAUNCH's _alpide_open_dir does
+        check('debug/app.log exists as soon as a folder does',
+              os.path.exists(os.path.join(folder, 'debug', 'app.log')))
+
+        with open(os.path.join(folder, 'debug', 'app.log')) as f:
+            text = f.read()
+        check('the pre-folder backlog is in there',
+              'flashing firmware' in text and 'connected' in text,
+              'contents: %r' % text)
+
+        app.log('[BEAM] killed by operator')
+        with open(os.path.join(folder, 'debug', 'app.log')) as f:
+            text2 = f.read()
+        check('lines logged after the folder exists are appended too',
+              'killed by operator' in text2)
+
+        app._close_app_log()
+        check('closing drops the file handle so the next _session_dir() '
+              'reopens fresh rather than writing through a stale one',
+              app._app_log_file is None)
+        app.log('[SESSION] would be lost without a session')
+        app._session_root = ''   # simulate the next run getting a fresh folder
+        folder2 = app._session_dir()
+        with open(os.path.join(folder2, 'debug', 'app.log')) as f:
+            text3 = f.read()
+        # the line logged between close and the next folder is still backlog,
+        # whether or not the timestamp-named folder happens to collide with
+        # the previous one within the same second
+        check('the gap between sessions is not lost either',
+              'would be lost without a session' in text3)
+
+        teardown(app, root)
+    finally:
+        config.OUTPUT_DIR = original_out
+        shutil.rmtree(tmp_out, ignore_errors=True)
+
+
+# ── analyze_latency.py runs itself after STOP ─────────────────────────────────
+
+def test_auto_analyze():
+    print('\n-- STOP hands the finished run to analyze_latency.py --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    import json
+    import shutil
+    app, _log = _idle_app(root)
+
+    folder = '/tmp/claude-1000/test_auto_analyze_session'
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(os.path.join(folder, 'alpide'), exist_ok=True)
+    with open(os.path.join(folder, 'session.json'), 'w') as f:
+        json.dump({'alpide_error': None, 'trigger_hz': 1000}, f)
+    # A real START writes this even before EUDAQ2 ever comes up, so an empty
+    # one (header only) is what a run that never got a .raw actually looks
+    # like — not the same as START never having been pressed at all.
+    with open(os.path.join(folder, 'alpide', 'beam_events.csv'), 'w') as f:
+        f.write('host_time_iso,host_monotonic,event,pulse,trig_running\n')
+    # Deliberately no .raw file: exercises the real subprocess and the real
+    # JSON round trip without needing to synthesize valid ALPIDE bytes —
+    # the decoder itself is already covered by test_latency.py.
+
+    app._auto_analyze(folder)
+
+    check('report.txt was written',
+          os.path.exists(os.path.join(folder, 'report.txt')))
+    json_path = os.path.join(folder, 'analysis.json')
+    check('analysis.json was written', os.path.exists(json_path))
+    if not os.path.exists(json_path):
+        teardown(app, root)
+        return
+    with open(json_path) as f:
+        analysis = json.load(f)
+    check('the verdict says why: no .raw file',
+          analysis.get('verdict') == 'no_raw_file',
+          'verdict %r' % analysis.get('verdict'))
+    check('_read_verdict agrees with what is on disk',
+          app._read_verdict(folder) == 'no_raw_file')
+    check('the status line reflects it',
+          'no_raw_file' in app._alpide_msg, 'msg %r' % app._alpide_msg)
+    # Via log_to_folder(), not log()'s in-memory buffer/current-session file —
+    # _auto_analyze runs after STOP has moved on, sometimes long after, so it
+    # must land in *this* folder's app.log regardless of whatever session (if
+    # any) is current by the time it finishes. A real run once produced a
+    # report.txt with no trace of it in debug/app.log because of exactly this
+    # race — this is the regression test for that.
+    log_path = os.path.join(folder, 'debug', 'app.log')
+    check('the run is noted in this session\'s own app.log, not wherever '
+          'the shared handle happened to be pointing',
+          os.path.exists(log_path) and
+          any('[ANALYZE]' in line for line in open(log_path)),
+          'exists=%s' % os.path.exists(log_path))
+    teardown(app, root)
+
+
+# ── session.json says how the run actually ended ─────────────────────────────
+
+def test_ended_field():
+    print('\n-- session.json records how the run actually ended, not just that it did --')
+    import json
+    import shutil
+
+    def session_json_at(folder):
+        with open(os.path.join(folder, 'session.json')) as f:
+            return json.load(f)
+
+    # Each case tears its own app and root down before the next one starts —
+    # on_close() in particular destroys the root itself, so no case can share
+    # one with another.
+    def run_case(folder, setup_and_act, destroys_root=False):
+        root = _try_root('900x700')
+        if root is None:
+            return None
+        shutil.rmtree(folder, ignore_errors=True)
+        app, _log = _idle_app(root)
+        app._session_root = folder
+        app.capture._armed = True
+        setup_and_act(app)
+        got = session_json_at(folder).get('ended')
+        if not destroys_root:
+            teardown(app, root)
+        return got
+
+    got = run_case('/tmp/claude-1000/test_ended_stop', lambda app: app.stop())
+    check("ordinary STOP records ended='stop'", got == 'stop', 'got %r' % got)
+
+    def _enable_off(app):
+        app.capture.running = True
+        app._confirm_disable_dialog = lambda: 'continue'
+        app.enable_var.set(False)   # the click that unchecked it, already applied
+        app._on_enable_toggle()
+    got = run_case('/tmp/claude-1000/test_ended_enable_off', _enable_off)
+    check("unchecking ENABLE mid-run records ended='enable_off'",
+          got == 'enable_off', 'got %r' % got)
+
+    def _arduino_reset(app):
+        import tkinter.messagebox as mb
+        mb.showwarning = lambda *a, **k: None
+        app._on_arduino_reset()
+    got = run_case('/tmp/claude-1000/test_ended_arduino_reset', _arduino_reset)
+    check("a board reset mid-run records ended='arduino_reset'",
+          got == 'arduino_reset', 'got %r' % got)
+
+    got = run_case('/tmp/claude-1000/test_ended_app_closed',
+                   lambda app: app.on_close(), destroys_root=True)
+    check("closing the app mid-run records ended='app_closed'",
+          got == 'app_closed', 'got %r' % got)
+
+
+def test_session_json_provenance():
+    print('\n-- session.json also says which code and which machine --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    import json
+    import shutil
+    app, _log = _idle_app(root)
+    folder = '/tmp/claude-1000/test_session_provenance'
+    shutil.rmtree(folder, ignore_errors=True)
+    app._session_root = folder
+    app.capture._armed = True
+    app.stop()
+
+    with open(os.path.join(folder, 'session.json')) as f:
+        info = json.load(f)
+    check('hostname is recorded', bool(info.get('hostname')))
+    check('git commit is recorded (this repo has one)',
+          bool(info.get('git_commit')), 'got %r' % info.get('git_commit'))
+    check('git_dirty is a real bool, not left unset', 'git_dirty' in info)
+    check('camera nominal_fps is recorded',
+          info.get('camera', {}).get('nominal_fps') is not None,
+          'camera %r' % info.get('camera'))
+    teardown(app, root)
+
+
+# ── beam time delivered ──────────────────────────────────────────────────────
+
+def test_beam_used_counter():
+    print('\n-- how much of the requested beam has been delivered --')
+    root = _try_root('900x700')
+    if root is None:
+        return
+    import time as _t
+    app, _log = _idle_app(root)
+    app._beam_on_total = 0.0
+    app._beam_on_since = None
+
+    check('nothing delivered before the shutter opens', app.beam_used_s() == 0.0)
+
+    app._beam_on()
+    _t.sleep(0.15)
+    running = app.beam_used_s()
+    check('it counts while the shutter is open', running >= 0.15,
+          'got %.3f' % running)
+
+    app._beam_on()      # the frame loop calls this on every ON frame
+    _t.sleep(0.1)
+    app._beam_off()
+    first = app._beam_on_total
+    check('re-entering ON does not restart the period', first >= 0.25,
+          'got %.3f' % first)
+
+    _t.sleep(0.15)
+    app._beam_off()     # and every OFF frame
+    check('time with the shutter shut does not count',
+          app._beam_on_total == first, 'got %.3f' % app._beam_on_total)
+
+    app._beam_on()
+    _t.sleep(0.1)
+    app._beam_off()
+    check('a second period adds to the first',
+          app._beam_on_total >= first + 0.1,
+          'got %.3f' % app._beam_on_total)
+    teardown(app, root)
+
+
 def test_arduino_reset():
     print('\n-- the board resetting mid-run --')
     import tkinter.messagebox as mb
@@ -366,6 +803,16 @@ if __name__ == '__main__':
     test_chatter_is_absorbed()
     test_stop_order()
     test_start_during_launch()
+    test_unready_tears_down_the_daq()
+    test_cancel_daq()
+    test_start_waits_for_its3()
+    test_daq_row_visibility()
+    test_auto_record()
+    test_app_log()
+    test_auto_analyze()
+    test_ended_field()
+    test_session_json_provenance()
+    test_beam_used_counter()
     test_arduino_reset()
     print()
     if FAILURES:

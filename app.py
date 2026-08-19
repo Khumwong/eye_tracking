@@ -1,9 +1,12 @@
+import collections
 import cv2
 import json
 import os
 import queue
 import re
+import socket
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -54,6 +57,15 @@ class EyeTrackingApp:
         self.ready = False
         self._cam_ok = False
 
+        # debug/app.log — launch.sh does not redirect stdout, so opening from
+        # a desktop icon loses every print() with nowhere to look afterwards.
+        # Buffered from process start (before any session folder exists) and
+        # flushed into the folder once one does — see log() and _open_app_log.
+        self._log_buffer  = collections.deque(maxlen=2000)
+        self._app_log_file = None
+        self._log_lock = threading.Lock()   # log() runs from worker threads too
+                                            # (_alpide_note) as well as the UI thread
+
         # ALPIDE acquisition (best-effort throughout — see alpide_daq docstring)
         self._alpide_pid     = None
         self._alpide_dir     = ''
@@ -64,8 +76,16 @@ class EyeTrackingApp:
         self._session_root   = ''      # output/session_<ts> for this run
         self._daq_ready      = False   # EUDAQ2 is up and RUNNING, trigger not yet started
         self._launch_state   = 'locked'
+        self._launch_seq     = 0       # generation counter for the launch watchdog
         self._pending_start_hz = None  # START pressed while LAUNCH was still coming up
         self._killed         = False   # operator override: beam forced off
+        # Beam time actually delivered this run. The beam is gated, so wall
+        # clock says nothing about how much of the requested dose is spent:
+        # a 20 s request takes 40 s of standing there if the eye is off target
+        # half the time. Only the accumulated ON time compares to what was asked
+        # for at the console.
+        self._beam_on_since  = None    # monotonic stamp of the current ON period
+        self._beam_on_total  = 0.0     # seconds the shutter has been open
         self.trigger_hz      = tk.IntVar(value=config.TRIGGER_HZ)
 
         self.eye_side       = tk.StringVar(value='left')
@@ -79,6 +99,10 @@ class EyeTrackingApp:
         self.video_loop     = tk.BooleanVar(value=True)
         self.playback_speed = tk.DoubleVar(value=1.0)
         self.video_progress = tk.DoubleVar(value=0.0)
+        # Intent, not state: checked before LAUNCH, acted on at LAUNCH (or at
+        # the no-DAQ fallback start) rather than a button pressed mid-run — see
+        # _maybe_auto_record.
+        self.record_enabled = tk.BooleanVar(value=False)
 
         self._video_fps          = 30.0
         self._video_total_frames = 0
@@ -642,14 +666,32 @@ class EyeTrackingApp:
         self._beam_sub = tk.Label(self._beam_frame, text="Shutter: Closed",
                                    bg=CARD, fg=MUTEDT, font=('Helvetica', 8))
         self._beam_sub.pack(pady=(4, 0))
+        # The run does have a defined end — the beam that was requested, fired
+        # to completion — but the gate means the clock on the wall does not
+        # measure it. This does.
+        self._beam_used_lbl = tk.Label(self._beam_frame, text="beam used  0.0 s",
+                                        bg=CARD, fg=MUTEDT,
+                                        font=('Courier', 9, 'bold'))
+        self._beam_used_lbl.pack(pady=(2, 0))
 
         # ── Controls ───────────────────────────────
         ctrl = tk.Frame(right, bg=PANEL)
         ctrl.pack(fill=tk.X, padx=12, pady=(4, 2))
 
-        self.ready_btn = self._flat_btn(ctrl, "○   READY",
-                                         self._toggle_ready, PANEL, TEXT2, INSET)
-        self.ready_btn.pack(fill=tk.X, pady=(0, 3))
+        # A checkbox, matching Kcmh-Tricker's Enable exactly rather than a
+        # button styled to look like a toggle — the two apps share a control
+        # room and should read the same at a glance. tk flips enable_var
+        # before calling the command, so _on_enable_toggle reads the state the
+        # click already produced rather than the one it is leaving.
+        self.enable_var = tk.BooleanVar(value=False)
+        self.enable_chk = tk.Checkbutton(
+            ctrl, text="  ENABLE", variable=self.enable_var,
+            command=self._on_enable_toggle,
+            bg=PANEL, fg=TEXT, activebackground=PANEL, activeforeground=TEXT,
+            selectcolor=CARD, disabledforeground=MUTEDT,
+            font=('Helvetica', 11, 'bold'), anchor='w', padx=10, pady=10,
+            cursor='hand2', bd=0, highlightthickness=0)
+        self.enable_chk.pack(fill=tk.X, pady=(0, 3))
         tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
 
         # Bringing EUDAQ2 up is its own step, as it is in Kcmh-Tricker ("Launch
@@ -662,21 +704,41 @@ class EyeTrackingApp:
                                           state=tk.DISABLED)
         self.launch_btn.pack(fill=tk.X, pady=(3, 3))
 
-        self.start_btn = self._flat_btn(ctrl, "▶   START TRACKING",
-                                         self.start, MUTED, PANEL, MUTED)
-        self.start_btn.pack(fill=tk.X, pady=(3, 3))
+        # Emergency fallback. START/STOP normally live inside a run only after
+        # LAUNCH, matching Kcmh-Tricker's Run staying hidden until its own
+        # Launch default — but ALPIDE is best-effort everywhere else in this
+        # app, and gating the beam has to stay reachable when the detector is
+        # the thing that is broken (board missing, flash failed, ITS3 tmux
+        # fighting Kcmh-Tricker for the same six boards). Deliberately smaller
+        # and off to the side, not styled as an alternative to LAUNCH: the
+        # ordinary path is always LAUNCH first, and this is one extra,
+        # separate click away from the flow that keeps all the data.
+        self.start_fallback_btn = self._flat_btn(
+            ctrl, "▸  start without DAQ", self.start, CARD, TEXT2, INSET)
+        self.start_fallback_btn.config(font=('Helvetica', 8, 'bold'), pady=6)
+        self._fallback_shown = False
 
-        self.stop_btn = self._flat_btn(ctrl, "■   STOP",
+        # Kcmh-Tricker's Run/Stop/Cancel appear together once Launch default
+        # has been pressed; this group does the same. Shown/hidden as a unit
+        # in _refresh_flow — CANCEL additionally hides on its own once armed,
+        # since STOP is then the only way out of a run.
+        self._run_group = tk.Frame(ctrl, bg=PANEL)
+        self._group_shown = False
+
+        self.start_btn = self._flat_btn(self._run_group, "▶   START TRACKING",
+                                         self.start, MUTED, PANEL, MUTED)
+        self.start_btn.pack(fill=tk.X, pady=(0, 3))
+
+        self.stop_btn = self._flat_btn(self._run_group, "■   STOP",
                                         self.stop, CARD, TEXT2, INSET,
                                         state=tk.DISABLED)
-        tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
         self.stop_btn.pack(fill=tk.X, pady=(0, 3))
-        tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X)
 
-        self.pause_btn = self._flat_btn(ctrl, "⏸   PAUSE",
-                                         self._toggle_pause, CARD, TEXT2,
-                                         INSET, state=tk.DISABLED)
-        self.pause_btn.pack(fill=tk.X)
+        self.cancel_btn = self._flat_btn(self._run_group, "✕   CANCEL DAQ",
+                                          self._cancel_daq, CARD, TEXT2, INSET)
+        self._cancel_shown = False
+
+        tk.Frame(ctrl, bg=BORD, height=1).pack(fill=tk.X, pady=(3, 0))
 
         # Always available once Enable is asserted, armed or not — cutting the
         # beam is never the action that needs a precondition. Latching, like
@@ -691,14 +753,23 @@ class EyeTrackingApp:
         self._divider(right)
 
         # ── Record ─────────────────────────────────
+        # A setting, not a button pressed every run: checked once, then acted
+        # on automatically at LAUNCH (or at the no-DAQ fallback start) — see
+        # _maybe_auto_record. Five of the first eight sessions recorded no
+        # video because nobody remembered to press a RECORD button, which is
+        # exactly the failure mode a checkbox that only has to be set once
+        # removes.
         self._section_header(right, "RECORDING  (camera only)")
+        self.record_chk = tk.Checkbutton(
+            right, text="  Record video (mp4)", variable=self.record_enabled,
+            bg=PANEL, fg=TEXT2, activebackground=PANEL, activeforeground=TEXT,
+            selectcolor=CARD, disabledforeground=MUTEDT,
+            font=('Helvetica', 9, 'bold'), anchor='w', padx=12,
+            cursor='hand2', bd=0, highlightthickness=0, state=tk.DISABLED)
+        self.record_chk.pack(fill=tk.X, pady=(0, 2))
         self.rec_timer_lbl = tk.Label(right, text="", bg=PANEL, fg=RED_TXT,
                                        font=('Courier', 9, 'bold'))
-        self.rec_timer_lbl.pack(pady=(2, 2))
-        self.rec_btn = self._flat_btn(right, "⏺   RECORD",
-                                       self._toggle_rec, CARD, TEXT2, INSET,
-                                       state=tk.DISABLED)
-        self.rec_btn.pack(fill=tk.X, padx=12, pady=(0, 3))
+        self.rec_timer_lbl.pack(pady=(0, 2))
         self.review_btn = self._flat_btn(right, "▶   REVIEW",
                                           self._review_last_recording,
                                           CARD, TEXT2, INSET, state=tk.DISABLED)
@@ -837,18 +908,6 @@ class EyeTrackingApp:
         self.center_y.set(fy)
         self.pos_lbl.config(text=f"X: {fx:4d}   Y: {fy:4d}")
 
-    # ── Pause ──────────────────────────────────────
-
-    def _toggle_pause(self):
-        if self.pause_event.is_set():
-            self.pause_event.clear()
-            self.pause_btn.config(text="▶   RESUME", bg=AMBERB, fg=AMBERL,
-                                  activebackground=AMBERL, activeforeground=AMBERB)
-        else:
-            self.pause_event.set()
-            self.pause_btn.config(text="⏸   PAUSE", bg=AMBERB, fg=AMBERL,
-                                  activebackground=AMBERL, activeforeground=AMBERB)
-
     # ── Progress ───────────────────────────────────
 
     def _on_seek(self, val):
@@ -874,11 +933,16 @@ class EyeTrackingApp:
 
     # ── Recording ──────────────────────────────────
 
-    def _toggle_rec(self):
-        if not self.capture or not self.capture._recording:
+    def _maybe_auto_record(self):
+        """Start the mp4 recorder if the operator checked the box.
+
+        Called from both LAUNCH and the no-DAQ fallback start — whichever one
+        actually begins a run — rather than from a button pressed mid-session.
+        Guarded on _recording so calling it from both places when a run does
+        go through LAUNCH is harmless."""
+        if (self.input_mode.get() == 'camera' and self.record_enabled.get()
+                and self.capture and not self.capture._recording):
             self._start_rec()
-        else:
-            self._stop_rec()
 
     def _start_rec(self):
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -886,16 +950,21 @@ class EyeTrackingApp:
         self.capture.start_recording(path)
         self._rec_path = path
         self._rec_start_time = time.time()
-        self.rec_btn.config(text="⏹   STOP REC", bg=REDB, fg=REDL,
-                            activebackground=REDB, activeforeground=REDL)
         self.review_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTEDT)
         self._tick_rec()
 
     def _stop_rec(self):
+        """Stop the recorder and hand the clip to REVIEW.
+
+        No confirmation dialog: recording now starts automatically (see
+        _maybe_auto_record), so this fires on every STOP/CANCEL rather than
+        only when an operator explicitly asked for one — a popup on every run
+        would be the wrong trade for what used to be a rare manual action.
+        Called from stop() and _cancel_daq(), the only two places a run
+        that was recording can end.
+        """
         if self.capture:
             self.capture.stop_recording()
-        self.rec_btn.config(text="⏺   RECORD", bg=PANEL, fg=MUTEDT,
-                            activebackground=INSET, activeforeground=TEXT2)
         self.rec_timer_lbl.config(text="")
         if self._rec_path:
             self.last_recording_path = self._rec_path
@@ -903,7 +972,6 @@ class EyeTrackingApp:
             self._rec_path = ''
             self.review_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
                                    activebackground=INSET, activeforeground=TEXT)
-            messagebox.showinfo("Saved", "Recording saved.\nกด REVIEW เพื่อเปิดดูซ้ำได้ทันที")
 
     def _review_last_recording(self):
         """Open the last recording in the OS default video player. Deliberately
@@ -1030,14 +1098,35 @@ class EyeTrackingApp:
 
     # ── Beam indicator ─────────────────────────────
 
+    def beam_used_s(self):
+        """Seconds the shutter has been open this run, the current period
+        included. This is the number that compares to the beam that was
+        requested at the console; wall clock does not, because every moment the
+        eye is off target costs time without costing dose."""
+        total = self._beam_on_total
+        if self._beam_on_since is not None:
+            total += time.monotonic() - self._beam_on_since
+        return total
+
     def _beam_on(self):
+        # Both indicator methods are called on every frame, not only on the
+        # transition, so the accumulation has to key off _beam_on_since rather
+        # than off being called.
+        if self._beam_on_since is None:
+            self._beam_on_since = time.monotonic()
         self._beam_frame.config(bg=REDB)
         self._beam_dot.config(bg=REDB)
         self._beam_dot.itemconfig(self._beam_oval, fill=REDL)
         self.beam_lbl.config(text="BEAM ACTIVE", bg=REDB, fg=REDL)
         self._beam_sub.config(text="Shutter: Open", bg=REDB, fg=REDL)
+        self._beam_used_lbl.config(text="beam used  %.1f s" % self.beam_used_s(),
+                                   bg=REDB, fg=REDL)
 
     def _beam_off(self):
+        if self._beam_on_since is not None:
+            self._beam_on_total += time.monotonic() - self._beam_on_since
+            self._beam_on_since = None
+        used = "beam used  %.1f s" % self._beam_on_total
         # Called from the frame loop on every off frame, so the killed state has
         # to be resolved here — set anywhere else it would be overwritten within
         # a frame. "Off because the eye moved" and "off because an operator cut
@@ -1048,12 +1137,14 @@ class EyeTrackingApp:
             self._beam_dot.itemconfig(self._beam_oval, fill=REDL)
             self.beam_lbl.config(text="BEAM KILLED", bg=REDB, fg=REDL)
             self._beam_sub.config(text="Cut by operator", bg=REDB, fg=REDL)
+            self._beam_used_lbl.config(text=used, bg=REDB, fg=REDL)
             return
         self._beam_frame.config(bg=CARD)
         self._beam_dot.config(bg=CARD)
         self._beam_dot.itemconfig(self._beam_oval, fill=MUTED)
         self.beam_lbl.config(text="BEAM OFF", bg=CARD, fg=MUTEDT)
         self._beam_sub.config(text="Shutter: Closed", bg=CARD, fg=MUTEDT)
+        self._beam_used_lbl.config(text=used, bg=CARD, fg=MUTEDT)
 
     # ── Ready check ─────────────────────────────────
     # Precondition gate (Arduino + camera connected) that also drives the DB9
@@ -1062,15 +1153,22 @@ class EyeTrackingApp:
     # instead of Enable being tied permanently high the moment the board has
     # power.
 
-    def _toggle_ready(self):
-        if not self.ready:
+    def _on_enable_toggle(self):
+        """Checkbutton command — enable_var already holds the state the click
+        just produced, not the one it is leaving (tk flips it before invoking
+        the command). A precondition failure or a cancelled dialog reverts the
+        checkbox with .set(), which does not re-fire this command."""
+        enabling = self.enable_var.get()
+        if enabling:
             if not self.arduino.is_connected:
                 messagebox.showwarning(
                     "Not connected", "Arduino ยังไม่เชื่อมต่อ กรุณาต่อ Arduino ก่อน")
+                self.enable_var.set(False)
                 return
             if not self._cam_ok:
                 messagebox.showwarning(
                     "Not connected", "กล้องยังไม่พร้อม กรุณาตรวจสอบกล้องก่อน")
+                self.enable_var.set(False)
                 return
             self.ready = True
             self.arduino.send(b'E1\n')
@@ -1080,13 +1178,20 @@ class EyeTrackingApp:
             if self.capture and self.capture.running and self.capture.armed:
                 choice = self._confirm_disable_dialog()
                 if choice == 'cancel':
+                    self.enable_var.set(True)
                     return
                 if choice == 'kill':
                     self.arduino.send(b'B0\n')
-                self.stop()
+                self.stop(ended='enable_off')
             self.arduino.send(b'E0\n')
             self.ready = False
             self._release_kill()        # Enable is down; the latch means nothing now
+            # Enable coming down ends the session, so anything LAUNCH brought up
+            # comes down with it. stop() above only runs for an armed run, and
+            # without this a launched-but-never-started run left EUDAQ2, the
+            # shared ITS3 tmux session and six powered chips behind — and the
+            # next LAUNCH returning silently because _alpide_pid was still set.
+            self._daq_teardown()
             self._set_launch_state('locked')
 
     def _confirm_disable_dialog(self):
@@ -1185,19 +1290,13 @@ class EyeTrackingApp:
                                activebackground=INSET, activeforeground=TEXT)
 
         if is_video:
-            self.pause_btn.config(text="⏸   PAUSE", state=tk.NORMAL,
-                                  bg=AMBERB, fg=AMBERL,
-                                  activebackground=AMBERL, activeforeground=AMBERB)
             self.prog_slider.config(state=tk.NORMAL)
             self.prog_lbl.config(
                 text=f"00:00 / {self._fmt(self._video_total_frames / self._video_fps)}")
-            self.rec_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTEDT)
+            self.record_chk.config(state=tk.DISABLED)
         else:
-            self.pause_btn.config(state=tk.DISABLED, bg=PANEL, fg=MUTEDT,
-                                  text="⏸   PAUSE")
             self.prog_slider.config(state=tk.DISABLED)
-            self.rec_btn.config(state=tk.NORMAL, bg=PANEL, fg=TEXT2,
-                                activebackground=INSET, activeforeground=TEXT)
+            self.record_chk.config(state=tk.NORMAL)
 
         self._update_frame()
 
@@ -1207,6 +1306,8 @@ class EyeTrackingApp:
             self.capture.stop_recording()
             self.capture.stop_cut_capture()   # closes cuts.csv on any teardown,
                                               # not only the one that goes via stop()
+            self.capture.stop_track_log()     # same reasoning: close track.csv
+                                              # on any teardown, not only stop()
             self.capture.stop()
             self.capture = None
         if self.cap:
@@ -1222,11 +1323,8 @@ class EyeTrackingApp:
         self.prog_lbl.config(text="--:-- / --:--")
         self._p['main_view'] = 'wide'
         self._last_view_meta = None
-        self.pause_btn.config(text="⏸   PAUSE", state=tk.DISABLED,
-                              bg=PANEL, fg=MUTEDT)
         self.prog_slider.config(state=tk.DISABLED)
-        self.rec_btn.config(text="⏺   RECORD", state=tk.DISABLED,
-                            bg=PANEL, fg=MUTEDT)
+        self.record_chk.config(state=tk.DISABLED)
         self.rec_timer_lbl.config(text="")
         if self._debug_active:
             self._debug_active = False
@@ -1247,6 +1345,8 @@ class EyeTrackingApp:
         self._threshold_scale.config(state=state)
         self._minoff_entry.config(state=state)
         self._trig_entry.config(state=state)
+        if self.input_mode.get() == 'camera':
+            self.record_chk.config(state=state)
         if self.debug:
             self._cam_tab.config(state=state)
             self._vid_tab.config(state=state)
@@ -1265,11 +1365,16 @@ class EyeTrackingApp:
             return
         self._set_config_locked(True)
         self._min_off_value()      # normalise the typed box against what is in force
+        self._beam_on_total = 0.0  # beam delivered is counted per run, not per app
+        self._beam_on_since = None
         # a fresh folder per run, unless LAUNCH/RECORD/debug already opened one
         if not self._session_root:
             self._session_dir()
         self._session_started = datetime.now().isoformat()
         self._write_session_json()
+        # Normally a no-op: LAUNCH already started it. Only the no-DAQ fallback
+        # (start_fallback_btn) reaches this without having gone through LAUNCH.
+        self._maybe_auto_record()
         # Only the trigger is started here, and only if LAUNCH already brought
         # EUDAQ2 up; T1 resets the board's pulse counter, so it must not fire
         # before the run is RUNNING or the pulse counts and EUDAQ's trigger
@@ -1280,10 +1385,12 @@ class EyeTrackingApp:
             # preview is already live (camera mode) — just arm the beam relay
             self.capture.armed = True
             self._begin_cut_capture()
+            self._begin_track_log()
             self._refresh_flow()
             return
         self._open_capture(armed=True)
         self._begin_cut_capture()
+        self._begin_track_log()
 
     def _begin_cut_capture(self):
         """Save the screen at every beam-off for the whole armed window.
@@ -1298,12 +1405,32 @@ class EyeTrackingApp:
         try:
             self.capture.start_cut_capture(self._session_dir('cuts'))
         except Exception as e:
-            print(f'[CUTS] not capturing: {type(e).__name__}: {e}')
+            self.log(f'[CUTS] not capturing: {type(e).__name__}: {e}')
 
-    def stop(self):
+    def _begin_track_log(self):
+        """Write track.csv for the whole armed window: deviation, detection
+        result, and gate decision on every frame, not only the ones a beam
+        transition happens on — the only record of the run's steady state, and
+        of how much of the beam's reaction time is spent on this side of the
+        serial link. Best-effort, same as cuts — a failure here must not stop
+        tracking."""
+        if not self.capture:
+            return
+        try:
+            self.capture.start_track_log(self._session_dir())
+        except Exception as e:
+            self.log(f'[TRACK] not logging: {type(e).__name__}: {e}')
+
+    def stop(self, ended='stop'):
         """Disarm the beam relay. In camera mode the preview keeps running
         (so the picture never goes blank between runs); video playback fully
-        stops, matching the old behaviour."""
+        stops, matching the old behaviour.
+
+        `ended` goes straight into session.json — 'stop' unless a caller that
+        forced this (a disabled Enable checkbox, an Arduino reset) says
+        otherwise, so a run that ended for one of those reasons is not
+        indistinguishable from an operator pressing STOP normally.
+        """
         # Cutting the beam and dropping the gate are one action, so they happen
         # together and first. Disarming later — after the ALPIDE teardown and
         # the session write, as this used to — leaves the capture loop armed for
@@ -1316,11 +1443,19 @@ class EyeTrackingApp:
         self._beam_off()
         self._set_config_locked(False)
         self.arduino.send(b'T0\n')
-        self._alpide_stop()
+        # Captured before _alpide_stop() can run — session_root is cleared a
+        # few lines below, but analyze_latency.py needs the path and this is
+        # the only place it is still known once the .raw is actually closed.
+        stopped_folder = self._session_root
+        self._alpide_stop(on_stopped=lambda: self._auto_analyze(stopped_folder))
         if self._session_root:
-            self._write_session_json(stopped=datetime.now().isoformat())
-            print(f'[SESSION] {self._session_root}')
+            # _beam_off() above closed the last ON period, so this is final
+            self._write_session_json(stopped=datetime.now().isoformat(),
+                                     beam_on_s=round(self._beam_on_total, 3),
+                                     ended=ended)
+            self.log(f'[SESSION] {self._session_root}')
             self._session_root = ''    # next run starts a new folder
+            self._close_app_log()      # the next one gets a fresh app.log
         # The run is over and its .raw is closed, so the next one has to launch
         # its own — the output path was baked into the EUDAQ2 config.
         self._pending_start_hz = None   # a launch still in flight must not
@@ -1332,6 +1467,7 @@ class EyeTrackingApp:
             # is being drained. The beam is already off, so the few milliseconds
             # this waits for the writer cost nothing.
             self.capture.stop_cut_capture()
+            self.capture.stop_track_log()
 
         if self.input_mode.get() == 'video':
             self._teardown_capture()
@@ -1339,10 +1475,7 @@ class EyeTrackingApp:
             # preview keeps running, but a run that was being recorded should
             # still end its recording when disarmed — matches the old
             # behaviour where STOP always closed out any active recording.
-            self.capture.stop_recording()
-            self.rec_btn.config(text="⏺   RECORD", bg=PANEL, fg=TEXT2,
-                                activebackground=INSET, activeforeground=TEXT)
-            self.rec_timer_lbl.config(text="")
+            self._stop_rec()
 
         self._refresh_flow()
 
@@ -1462,10 +1595,16 @@ class EyeTrackingApp:
     # timestamps.
     #
     #   output/session_<ts>/
-    #     ├── alpide/   run*.raw + beam_events.csv   (the latency measurement)
-    #     ├── video/    eye_tracking_*.mp4           (RECORD)
-    #     ├── debug/    log.csv + crop_*.jpg         (debug mode only)
-    #     └── session.json                           (settings + timing)
+    #     ├── alpide/        run*.raw + beam_events.csv    (the latency measurement)
+    #     ├── cuts/          cut_*.jpg + cuts.csv           (screenshot on every beam-off)
+    #     ├── video/         eye_tracking_*.mp4             (RECORD)
+    #     ├── debug/
+    #     │   ├── log.csv + crop_*.jpg                      (debug mode only)
+    #     │   ├── app.log                                   ([ALPIDE]/[BEAM]/[Arduino] lines — see log())
+    #     │   └── eudaq.log                                 (RunControl's last screen before STOP kills it)
+    #     ├── track.csv      per-frame log for the whole armed window (see capture.py)
+    #     ├── session.json   settings + timing + provenance + how the run ended
+    #     └── latency.csv, report.txt, analysis.json         (analyze_latency.py, auto-run at STOP)
 
     def _session_dir(self, sub=None):
         """Path inside the current run's folder, creating it on first use.
@@ -1477,14 +1616,100 @@ class EyeTrackingApp:
             ts = time.strftime('%Y%m%d_%H%M%S')
             self._session_root = os.path.join(
                 os.path.dirname(__file__), config.OUTPUT_DIR, f'session_{ts}')
+            self._open_app_log()
         path = os.path.join(self._session_root, sub) if sub else self._session_root
         os.makedirs(path, exist_ok=True)
         return path
 
+    # ── App-wide event log ─────────────────────────────────
+    # launch.sh does not redirect stdout, so every [ALPIDE]/[BEAM]/[Arduino]
+    # print() is invisible when the app is opened from the desktop icon —
+    # exactly the runs that most need explaining afterwards. log() replaces
+    # print() everywhere in this file (and the modules it drives) so those
+    # lines end up in debug/app.log as well as the terminal, when there is one.
+
+    def log(self, msg):
+        """print() plus a copy in debug/app.log. Called from worker threads
+        (_alpide_note, the Arduino reader) as well as the UI thread, hence the
+        lock around the buffer/file — a torn line is worse than a slow one.
+
+        Writes through `self._app_log_file`, which is scoped to whichever
+        session is current *right now* — a caller reporting on a session that
+        has already ended (_auto_analyze, running well after STOP closed this
+        session's handle) will silently miss the file, or worse, land in
+        whatever session opens next. See log_to_folder for that case.
+        """
+        line = f'{datetime.now().isoformat()} {msg}'
+        print(msg)
+        with self._log_lock:
+            self._log_buffer.append(line)
+            if self._app_log_file is not None:
+                try:
+                    self._app_log_file.write(line + '\n')
+                    self._app_log_file.flush()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def log_to_folder(folder, msg):
+        """Append directly to a specific session's debug/app.log, bypassing
+        the current-session file handle log() uses. For callers that know
+        exactly which folder they mean and must not depend on it still being
+        "the current session" — _auto_analyze runs on a worker thread after
+        STOP has already moved on, sometimes well after (analysis can take
+        longer than the gap to the next LAUNCH), so log() would either drop
+        the line or misfile it into whatever session comes next."""
+        line = f'{datetime.now().isoformat()} {msg}'
+        print(msg)
+        try:
+            path = os.path.join(folder, 'debug', 'app.log')
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'a') as f:
+                f.write(line + '\n')
+        except Exception:
+            pass
+
+    def _open_app_log(self):
+        """Flush the backlog into debug/app.log for this session and keep
+        appending. Called once, right after _session_root is assigned — most
+        of what explains a bad run (Arduino connect, camera failing to open, a
+        firmware flash) happens before LAUNCH, before any folder exists, which
+        is why log() buffers from process start rather than only once this is
+        open."""
+        with self._log_lock:
+            try:
+                folder = os.path.join(self._session_root, 'debug')
+                os.makedirs(folder, exist_ok=True)
+                self._app_log_file = open(os.path.join(folder, 'app.log'), 'a')
+                for line in self._log_buffer:
+                    self._app_log_file.write(line + '\n')
+                self._app_log_file.flush()
+            except Exception:
+                self._app_log_file = None
+
+    def _close_app_log(self):
+        """Called wherever _session_root is reset to '' — the next session
+        gets its own folder and so must get its own app.log, opened fresh by
+        the next _open_app_log() rather than appended to across runs."""
+        with self._log_lock:
+            f, self._app_log_file = self._app_log_file, None
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
     def _write_session_json(self, **extra):
         """Snapshot of what produced the data. Without this the .raw and the CSV
         are unreadable a week later — nothing else records which eye was
-        tracked, where the target was, or what threshold was in force."""
+        tracked, where the target was, or what threshold was in force.
+
+        Also carries provenance (which commit, which machine) and how the run
+        actually ended — `extra['ended']` is the caller's business (stop(),
+        on_close(), the Arduino-reset handler each know their own reason);
+        everything else here is read fresh, best-effort, field by field, so
+        one failing (no git installed, camera gone) never costs the rest.
+        """
         info = {
             'started':        getattr(self, '_session_started', None),
             'eye_side':       self.eye_side.get(),
@@ -1504,6 +1729,64 @@ class EyeTrackingApp:
             # folder instead of looking like every other run
             'alpide_error':   self._alpide_failed,
         }
+
+        try:
+            info['hostname'] = socket.gethostname()
+        except Exception:
+            pass
+        try:
+            here = os.path.dirname(__file__)
+            commit = subprocess.run(
+                ['git', 'rev-parse', '--short', 'HEAD'], cwd=here,
+                capture_output=True, text=True, timeout=5).stdout.strip()
+            dirty = bool(subprocess.run(
+                ['git', 'status', '--porcelain'], cwd=here,
+                capture_output=True, text=True, timeout=5).stdout.strip())
+            if commit:
+                info['git_commit'] = commit
+                info['git_dirty'] = dirty
+        except Exception:
+            pass
+
+        camera = {}
+        try:
+            if self.cap is not None:
+                camera['width']  = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                camera['height'] = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            camera['nominal_fps'] = round(self._video_fps, 2)
+        except Exception:
+            pass
+        try:
+            # Only while track logging is actually live — at LAUNCH, before
+            # START, _track_frame_idx is either 0 or a leftover from the
+            # previous run and would report a meaningless rate.
+            if self.capture is not None and self.capture._track_writer is not None:
+                frames = self.capture._track_frame_idx
+                started = getattr(self, '_session_started', None)
+                if frames and started:
+                    elapsed = (datetime.now()
+                              - datetime.fromisoformat(started)).total_seconds()
+                    if elapsed > 0:
+                        info['frames'] = frames
+                        camera['achieved_fps'] = round(frames / elapsed, 2)
+        except Exception:
+            pass
+        if camera:
+            info['camera'] = camera
+
+        try:
+            if self.capture is not None:
+                info['cuts_saved']   = self.capture._cut_saved
+                info['cuts_dropped'] = self.capture._cut_dropped
+        except Exception:
+            pass
+        try:
+            path = os.path.join(self._session_dir('alpide'), 'beam_events.csv')
+            with open(path) as f:
+                info['beam_transitions'] = max(sum(1 for _ in f) - 1, 0)  # - header
+        except Exception:
+            pass
+
         info.update(extra)
         try:
             with open(os.path.join(self._session_dir(), 'session.json'), 'w') as f:
@@ -1638,14 +1921,14 @@ class EyeTrackingApp:
             with open(os.path.join(folder, 'eudaq.log'), 'w') as f:
                 f.write(text.rstrip() + '\n')
         except Exception as e:
-            print(f'[ALPIDE] could not save eudaq.log: {type(e).__name__}: {e}')
+            self.log(f'[ALPIDE] could not save eudaq.log: {type(e).__name__}: {e}')
 
     def _alpide_note(self, msg):
         """Called from worker threads, so the label refresh is marshalled back to
         the UI thread — the status poll is paused during a firmware flash, which
         is exactly when progress matters most."""
         self._alpide_msg = msg
-        print(f'[ALPIDE] {msg}')
+        self.log(f'[ALPIDE] {msg}')
         try:
             self.root.after(0, self._alpide_show)
         except Exception:
@@ -1700,35 +1983,88 @@ class EyeTrackingApp:
         armed = bool(self.capture and self.capture.armed)
         launching = self._launch_state == 'launching'
 
-        # 1 READY — the only step available before anything else
-        self._paint(self.ready_btn,
-                    "●   1  UNREADY" if self.ready else "○   1  READY",
-                    self._DONE if self.ready else self._NEXT, True)
+        # ENABLE — a checkbox, matching Kcmh-Tricker, outside the numbering.
+        # Only the colour is set here. enable_var itself is never touched from
+        # this method: every path that changes self.ready already keeps it in
+        # step (_on_enable_toggle reads the click tk already applied to it;
+        # _on_arduino_reset sets it explicitly) — resyncing it here as well
+        # would read back whatever it currently holds and could stomp on a
+        # toggle still being decided if this ever ran in between.
+        self.enable_chk.config(bg=CARD if self.ready else PANEL,
+                               fg=GREEN_TXT if self.ready else TEXT,
+                               selectcolor=CARD)
 
-        # 2 LAUNCH DAQ
+        # 1 LAUNCH DAQ
         if not self.ready:
-            self._paint(self.launch_btn, "▸   2  LAUNCH DAQ", self._OFF, False)
+            self._paint(self.launch_btn, "▸   1  LAUNCH DAQ", self._OFF, False)
         elif launching:
-            self._paint(self.launch_btn, "    2  launching…", self._OPEN, False)
+            self._paint(self.launch_btn, "    1  launching…", self._OPEN, False)
         elif self._daq_ready:
-            self._paint(self.launch_btn, "✓   2  DAQ READY", self._DONE, False)
+            self._paint(self.launch_btn, "✓   1  DAQ READY", self._DONE, False)
         elif armed:
-            self._paint(self.launch_btn, "▸   2  LAUNCH DAQ", self._OFF, False)
+            self._paint(self.launch_btn, "▸   1  LAUNCH DAQ", self._OFF, False)
         else:
-            self._paint(self.launch_btn, "▸   2  LAUNCH DAQ", self._NEXT, True)
+            self._paint(self.launch_btn, "▸   1  LAUNCH DAQ", self._NEXT, True)
 
-        # 3 START — allowed without LAUNCH (it falls back to launching itself),
-        # but only styled as the next step once the DAQ is actually up, so the
-        # bright button always points at the path that keeps all the data.
+        # START / STOP / CANCEL appear together, as a group, only once there is
+        # a DAQ session to run them against — matching Kcmh-Tricker's Run/Stop/
+        # Cancel staying hidden until Launch default. _alpide_pid is checked
+        # alongside the launch state so a bring-up that never reported back
+        # (see _launch_watchdog) still keeps CANCEL reachable after the
+        # watchdog has already let go of 'launching'.
+        show_group = (armed or launching or self._daq_ready
+                     or self._alpide_pid is not None)
+        if show_group and not self._group_shown:
+            self._run_group.pack(fill=tk.X, pady=(0, 3), after=self.launch_btn)
+        elif self._group_shown and not show_group:
+            self._run_group.pack_forget()
+        self._group_shown = show_group
+
+        # The one deliberate exception: ALPIDE is best-effort everywhere else
+        # in this app, and gating the beam must stay reachable even with no
+        # detector at all — this is what stands in for START before LAUNCH.
+        show_fallback = self.ready and not show_group
+        if show_fallback and not self._fallback_shown:
+            self.start_fallback_btn.pack(fill=tk.X, pady=(2, 3),
+                                         after=self.launch_btn)
+        elif self._fallback_shown and not show_fallback:
+            self.start_fallback_btn.pack_forget()
+        self._fallback_shown = show_fallback
+        if show_fallback:
+            self._paint(self.start_fallback_btn, "▸  start without DAQ",
+                       self._OPEN, True)
+
+        # CANCEL — inside the group, but hides on its own once armed: STOP is
+        # then the only way out of a run.
+        show_cancel = show_group and not armed
+        if show_cancel and not self._cancel_shown:
+            self.cancel_btn.pack(fill=tk.X, pady=(0, 3), after=self.stop_btn)
+        elif self._cancel_shown and not show_cancel:
+            self.cancel_btn.pack_forget()
+        self._cancel_shown = show_cancel
+        if show_cancel:
+            self._paint(self.cancel_btn, "✕   CANCEL DAQ", self._OPEN, True)
+
+        # 2 START — bright only once the DAQ is actually up, so the bright
+        # button always points at the path that keeps all the data.
+        #
+        # Held shut while a launch is in flight, the way Kcmh-Tricker holds Run
+        # shut until rc.log says StartRun. This costs nothing at the console:
+        # the ten seconds are spent during setup, and by the time START has to
+        # land within three seconds of Beam On the DAQ has long been up. A
+        # launch that fails or never answers releases it again (_launch_done,
+        # _launch_watchdog) — the detector must never be able to trap the gate.
         if armed or not self.ready:
-            self._paint(self.start_btn, "▶   3  START TRACKING", self._OFF, False)
+            self._paint(self.start_btn, "▶   2  START TRACKING", self._OFF, False)
+        elif launching:
+            self._paint(self.start_btn, "⏳   2  waiting for ITS3…", self._OFF, False)
         elif self._daq_ready:
-            self._paint(self.start_btn, "▶   3  START TRACKING", self._NEXT, True)
+            self._paint(self.start_btn, "▶   2  START TRACKING", self._NEXT, True)
         else:
-            self._paint(self.start_btn, "▶   3  START TRACKING", self._OPEN, True)
+            self._paint(self.start_btn, "▶   2  START TRACKING", self._OPEN, True)
 
-        # 4 STOP — the next step for as long as a run is in progress
-        self._paint(self.stop_btn, "■   4  STOP",
+        # 3 STOP — the next step for as long as a run is in progress
+        self._paint(self.stop_btn, "■   3  STOP",
                     self._DANGER if armed else self._OFF, armed)
 
         # KILL BEAM — outside the numbering; available whenever Enable is up
@@ -1763,7 +2099,7 @@ class EyeTrackingApp:
         self.arduino.send(b'B0\n')
         self._beam_off()
         self._refresh_flow()
-        print('[BEAM] killed by operator')
+        self.log('[BEAM] killed by operator')
 
     def _release_kill(self):
         """Hand the beam back to the eye. Safe to call when nothing is latched."""
@@ -1777,7 +2113,7 @@ class EyeTrackingApp:
         # not when one is not — repaint here so the panel cannot be left
         # claiming a kill that is no longer in force.
         self._beam_off()
-        print('[BEAM] kill released')
+        self.log('[BEAM] kill released')
 
     def _alpide_open_dir(self):
         """Bind this run's output folder. Whichever of LAUNCH or START happens
@@ -1845,7 +2181,12 @@ class EyeTrackingApp:
         # so a folder that is launched but never started still describes itself
         self._session_started = datetime.now().isoformat()
         self._write_session_json()
+        self._maybe_auto_record()
         self._set_launch_state('launching')
+        self._launch_seq += 1
+        seq = self._launch_seq
+        self.root.after(self._LAUNCH_WATCHDOG_MS,
+                        lambda: self._launch_watchdog(seq))
 
         def _work():
             ok = False
@@ -1871,6 +2212,12 @@ class EyeTrackingApp:
         if hz is None:
             if ok:
                 self._alpide_note('DAQ พร้อม — รอ START')
+                # START only just became pressable, and whoever pressed LAUNCH
+                # has spent the last ten seconds looking at something else.
+                try:
+                    self.root.bell()
+                except Exception:
+                    pass
             return
         if ok:
             # START was pressed while this was still coming up
@@ -1883,6 +2230,57 @@ class EyeTrackingApp:
             # says nothing and is worth replacing with what actually happened.
             if self._alpide_failed in (None, 'not started'):
                 self._alpide_failed = 'launch failed, no trigger started'
+
+    # Longer than the worst case _alpide_bring_up() can take by itself
+    # (wait_for_running is 40 s, plus a stale-session cleanup and two lsusb
+    # polls). This is not a timeout on the launch — the worker is left alone to
+    # finish — it only releases the START button if the worker never answers.
+    _LAUNCH_WATCHDOG_MS = 60_000
+
+    def _launch_watchdog(self, seq):
+        """Give START back if a launch never reported either way.
+
+        Holding START shut while the DAQ comes up is right; holding it shut
+        forever because a bring-up wedged is not, because the beam is gated by
+        this app and nothing else. If the worker does answer later, _launch_done
+        still resolves normally and a START pressed meanwhile is still picked up
+        through _pending_start_hz.
+        """
+        if seq != self._launch_seq or self._launch_state != 'launching':
+            return
+        self._alpide_note('launch ไม่ตอบใน 60 วิ — START กดได้แล้ว')
+        self._set_launch_state('idle')
+
+    def _daq_teardown(self):
+        """Stop a EUDAQ2 run that no START will ever use, and release its folder.
+
+        stop() does this for a run that was armed. Nothing did it for a run that
+        was launched and then abandoned: _alpide_pid stayed set, and the first
+        thing _launch_daq() does is return when it is — so the next LAUNCH did
+        nothing at all while its button sat there lit as the step to press.
+        """
+        self._alpide_stop()             # saves eudaq.log while _session_root lives
+        self._session_root = ''         # the next run gets its own folder
+        self._close_app_log()           # the next one gets a fresh app.log
+        self._pending_start_hz = None
+
+    def _cancel_daq(self):
+        """CANCEL DAQ — undo LAUNCH, and only LAUNCH.
+
+        Deliberately touches nothing on the beam side: no relay command, no
+        change to Enable, no release of the kill latch. It is the detector that
+        is being cancelled, and a button that quietly also moved the beam state
+        would be the wrong thing to hand an operator mid-setup. A recording
+        LAUNCH started is stopped here too — it is data about a run that is no
+        longer happening, not part of the beam-side state.
+        """
+        if self.capture and self.capture.armed:
+            return                      # during a run STOP is the only way out
+        self._daq_teardown()
+        if self.capture and self.capture._recording:
+            self._stop_rec()
+        self._alpide_note('launch cancelled')
+        self._set_launch_state('idle' if self.ready else 'locked')
 
     def _alpide_start(self, hz):
         """Start recording for this run, arming regardless of how it goes.
@@ -1921,7 +2319,14 @@ class EyeTrackingApp:
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _alpide_stop(self):
+    def _alpide_stop(self, on_stopped=None):
+        """Stop EUDAQ2. `on_stopped`, if given, runs on the worker thread once
+        stop_run() actually returns — not when this method does, which fires
+        the tmux kill and moves on without waiting. stop() uses it to start
+        analyze_latency.py only once the .raw is genuinely closed; every other
+        caller (on_close, _daq_teardown) leaves it unset, since a launch that
+        was cancelled or abandoned before START has nothing worth analysing.
+        """
         pid, self._alpide_pid = self._alpide_pid, None
         self._close_ev_log()
         # Before the early return below, not after: a run that never started is
@@ -1939,8 +2344,83 @@ class EyeTrackingApp:
         def _work():
             alpide_daq.stop_run(pid)
             self._alpide_note('stopped')
+            if on_stopped is not None:
+                on_stopped()
 
         threading.Thread(target=_work, daemon=True).start()
+
+    def _auto_analyze(self, folder):
+        """Run analyze_latency.py against the run that just finished, so the
+        data health / beam-vs-noise / transition report and report.txt /
+        analysis.json exist without anyone having to remember the command.
+
+        Runs on the worker thread _alpide_stop() already has going (the one
+        that called stop_run() and is about to call this) — never the UI
+        thread, and never before STOP itself has already returned. A
+        subprocess rather than an in-process call for the same reason ALPIDE
+        acquisition is a subprocess: numpy and the decoder have no business
+        in the process that gates the beam, and if the analyzer crashes it
+        crashes alone.
+
+        eudaq.stop() already sleeps ~6 s before killing the tmux session
+        specifically so RunControl finishes flushing the .raw first — but its
+        exception fallback (stop_run()'s except branch) skips that wait
+        entirely, so this still checks the file size has stopped moving
+        before handing it to the analyzer, up to 5 s, best-effort rather than
+        a guarantee.
+        """
+        if not folder:
+            return
+        raw_dir = os.path.join(folder, 'alpide')
+        try:
+            raws = sorted(f for f in os.listdir(raw_dir) if f.endswith('.raw'))
+        except Exception:
+            raws = []
+        if raws:
+            path = os.path.join(raw_dir, raws[-1])
+            last = -1
+            for _ in range(5):
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    break
+                if size == last:
+                    break
+                last = size
+                time.sleep(1.0)
+
+        self._alpide_note('analyzing…')
+        script = os.path.join(os.path.dirname(__file__), 'analyze_latency.py')
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, folder, '--quiet'],
+                capture_output=True, text=True, timeout=180)
+            verdict = self._read_verdict(folder)
+            self._alpide_note('analysis: %s' % (verdict or 'see report.txt'))
+            # log_to_folder, not log(): by the time this runs, STOP has long
+            # since closed this session's app.log (or a new session has
+            # opened its own) — log() would drop the line or misfile it into
+            # whichever session is current now instead of the one this is
+            # actually about.
+            self.log_to_folder(folder, '[ANALYZE] exit %d, verdict=%s'
+                               % (proc.returncode, verdict))
+            if proc.returncode not in (0, 2):   # 2 == no beam signal, expected
+                                                # for every run without protons
+                self.log_to_folder(folder, '[ANALYZE] stderr: %s'
+                                   % proc.stderr.strip())
+        except Exception as e:
+            self._alpide_note('analysis failed to run: %s: %s'
+                              % (type(e).__name__, e))
+            self.log_to_folder(folder, '[ANALYZE] failed to run: %s: %s'
+                               % (type(e).__name__, e))
+
+    @staticmethod
+    def _read_verdict(folder):
+        try:
+            with open(os.path.join(folder, 'analysis.json')) as f:
+                return json.load(f).get('verdict')
+        except Exception:
+            return None
 
     # ── Beam/pulse correlation log ─────────────────
     # The board reports the trigger pulse count at each beam transition, and the
@@ -1980,7 +2460,7 @@ class EyeTrackingApp:
             self.root.after(0, self._on_arduino_reset)
             return
         if not line.startswith('EV '):
-            print(f'[Arduino] {line}')
+            self.log(f'[Arduino] {line}')
             return
         parts = line.split()
         if len(parts) != 4:
@@ -2009,13 +2489,15 @@ class EyeTrackingApp:
         """
         if not (self.ready or (self.capture and self.capture.armed)):
             return                       # the ordinary banner at connect time
-        print('[Arduino] board reset mid-session — dropping to UNREADY')
+        self.log('[Arduino] board reset mid-session — dropping to UNREADY')
         self._alpide_failed = 'Arduino reset mid-run (pulse counter lost)'
         if self.capture and self.capture.armed:
-            self.stop()
+            self.stop(ended='arduino_reset')
         self.ready = False
+        self.enable_var.set(False)       # the checkbox must not keep claiming Enable
         self.arduino.send(b'E0\n')       # match our state to the board's
         self._release_kill()
+        self._daq_teardown()             # a launch left up behind Enable coming down
         self._set_launch_state('locked')
         self._alpide_note('Arduino รีเซ็ต — กด READY ใหม่')
         messagebox.showwarning(
@@ -2059,12 +2541,20 @@ class EyeTrackingApp:
         # Disarm before the relay commands, for the same reason as stop(): an
         # armed capture loop re-states its decision periodically and would
         # otherwise race the B0 below.
+        was_armed = bool(self.capture and self.capture.armed)
         if self.capture:
             self.capture.armed = False
         self.arduino.send(b'B0\n')
         self.arduino.send(b'T0\n')
         self.arduino.send(b'E0\n')
+        if was_armed and self._session_root:
+            # stop() never ran, so nothing recorded how this run actually
+            # ended — without this a run the app died in the middle of looks
+            # exactly like one that finished normally.
+            self._write_session_json(ended='app_closed')
+            self.log(f'[SESSION] {self._session_root} — app closed while armed')
         self._alpide_stop()
         self._teardown_capture()
+        self._close_app_log()
         self.arduino.close()
         self.root.destroy()

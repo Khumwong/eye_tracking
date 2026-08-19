@@ -272,6 +272,129 @@ def test_csv_and_report(tmp='/tmp/claude-1000/test_latency_out'):
           [int(r['trig_commanded']) for r in out] == [5000, 10000, 15000])
 
 
+# ── latency budget: the software-side half of the chain ──────────────────────
+
+def write_track_csv(path, n_frames, decide_ms_seq, period_ms):
+    """A minimal synthetic track.csv: only t_capture/t_decided matter to
+    compute_budget, so the other columns are filled with harmless constants."""
+    import csv
+    t = 1_000_000.0   # arbitrary epoch; only differences matter
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['frame', 'host_time_iso', 't_capture', 't_decided',
+                    'deviation_mm', 'iris_px', 'detect', 'gate', 'beam_state',
+                    'reason'])
+        for i in range(n_frames):
+            decide = decide_ms_seq[i % len(decide_ms_seq)] / 1000.0
+            w.writerow([i, '', '%.6f' % t, '%.6f' % (t + decide),
+                       '2.0', '40.0', '1', '1', 'O', ''])
+            t += period_ms / 1000.0
+
+
+def test_compute_budget(tmp='/tmp/claude-1000/test_latency_budget'):
+    print('\n-- track.csv becomes the [3]→[5] half of the latency budget --')
+    import os
+    os.makedirs(tmp, exist_ok=True)
+
+    check('no track.csv: nothing to compute',
+          al.compute_budget(os.path.join(tmp, 'nowhere')) is None)
+
+    # 100 frames alternating a 10 ms and a 20 ms decide cost, 33.3 ms apart —
+    # median decide is 15 ms, median period is 33.3 ms.
+    write_track_csv(os.path.join(tmp, 'track.csv'), 100, [10.0, 20.0], 33.3)
+    budget = al.compute_budget(tmp)
+    check('detect+decide median matches the synthetic sequence',
+          abs(budget['detect_decide_ms']['median'] - 15.0) < 0.5,
+          'got %s' % budget['detect_decide_ms'])
+    check('frame period median matches the synthetic spacing',
+          abs(budget['frame_period_ms']['median'] - 33.3) < 0.5,
+          'got %s' % budget['frame_period_ms'])
+    check('p95 is at least the median (right tail, not left)',
+          budget['detect_decide_ms']['p95'] >= budget['detect_decide_ms']['median'])
+
+    # A single row cannot give a period (needs a second t_capture to diff
+    # against) and should not crash trying — treated the same as no data.
+    write_track_csv(os.path.join(tmp, 'track.csv'), 1, [10.0], 33.3)
+    check('one row is not enough to compute anything from',
+          al.compute_budget(tmp) is None)
+
+
+def test_report_budget_and_closing_leg(tmp='/tmp/claude-1000/test_latency_budget2'):
+    print('\n-- the closing-leg total is detect+decide plus command→beam-off --')
+    import os
+    os.makedirs(tmp, exist_ok=True)
+    write_track_csv(os.path.join(tmp, 'track.csv'), 200, [12.0], 25.0)
+    budget = al.compute_budget(tmp)
+    al.report_budget(budget, meta={'min_off_s': 1.0})
+    check('base report does not add the closing-leg fields yet',
+          'command_to_beam_off_ms' not in budget)
+    check('the min_off note is recorded', budget.get('opening_leg_min_off_s') == 1.0)
+
+    n_trig = 20000
+    events = [(5000, 'B0', 0.0), (10000, 'B1', 0.0)]
+    truth = {5000: 5040, 10000: 10012}
+    hits = synth_run(n_trig, events, truth, beam_rate=20.0, noise_rate=3.0)
+    rows, _ = run_analysis(hits, events, n_trig)
+
+    al.report_budget_closing_leg(budget, rows)
+    check('command-to-beam-off is the B0 median from rows',
+          abs(budget['command_to_beam_off_ms'] - 40.0) < 1.5,
+          'got %s' % budget.get('command_to_beam_off_ms'))
+    check('the total is detect+decide plus that',
+          abs(budget['total_close_leg_ms']
+              - (budget['detect_decide_ms']['median']
+                 + budget['command_to_beam_off_ms'])) < 0.01)
+    check('command-to-beam-on is the B1 median from rows',
+          abs(budget['command_to_beam_on_ms'] - 12.0) < 1.5,
+          'got %s' % budget.get('command_to_beam_on_ms'))
+
+
+# ── report.txt / analysis.json plumbing ───────────────────────────────────────
+
+def test_tee_and_writers(tmp='/tmp/claude-1000/test_latency_files'):
+    print('\n-- report.txt captures what was printed, analysis.json round-trips --')
+    import json
+    import os
+    os.makedirs(tmp, exist_ok=True)
+
+    tee = al._Tee(open(os.devnull, 'w'))
+    tee.write('session: somewhere\n')
+    tee.write('── data health ──\n')
+    check('the tee accumulates everything written to it',
+          tee.getvalue() == 'session: somewhere\n── data health ──\n')
+
+    report_path = al.write_report(tmp, tee.getvalue())
+    with open(report_path) as f:
+        check('report.txt has exactly what was tee\'d', f.read() == tee.getvalue())
+
+    analysis = {'verdict': 'ok', 'health': {'n_events': 5},
+               'weird': np.int64(3), 'weirder': np.float64(1.5)}
+    json_path = al.write_analysis_json(tmp, analysis)
+    with open(json_path) as f:
+        back = json.load(f)
+    check('plain fields round-trip', back['verdict'] == 'ok' and back['health']['n_events'] == 5)
+    check('numpy scalars are made JSON-native, not left to crash json.dump',
+          back['weird'] == 3 and back['weirder'] == 1.5)
+
+
+def test_read_beam_events_missing_file(tmp='/tmp/claude-1000/test_no_beam_events'):
+    print('\n-- a missing beam_events.csv fails cleanly, not with a traceback --')
+    import os
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(os.path.join(tmp, 'alpide'), exist_ok=True)
+    # No beam_events.csv at all — a session LAUNCHed but never STARTed.
+    try:
+        al.read_beam_events(tmp)
+        check('a missing file is refused, not read as empty', False)
+    except SystemExit as e:
+        check('refused with a message that says why',
+              isinstance(e.code, str) and 'beam_events.csv' in e.code,
+              'got %r' % (e.code,))
+    except Exception as e:
+        check('refused with SystemExit, not %s' % type(e).__name__, False)
+
+
 def test_intervals():
     print('\n-- beam state before the first command --')
     iv = al.beam_state_intervals([(100, 'B0', 0.0), (200, 'B1', 0.0)], 300)
@@ -296,6 +419,10 @@ if __name__ == '__main__':
     test_never_changes()
     test_already_on()
     test_csv_and_report()
+    test_compute_budget()
+    test_report_budget_and_closing_leg()
+    test_tee_and_writers()
+    test_read_beam_events_missing_file()
     print()
     if FAILURES:
         print('%d failed: %s' % (len(FAILURES), ', '.join(FAILURES)))

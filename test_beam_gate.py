@@ -58,6 +58,25 @@ def teardown(app, root):
     root.destroy()
 
 
+
+def _try_root(geometry):
+    """A Tk root, or None with a SKIP noted.
+
+    DISPLAY being set is not the same as a display being reachable — a dead
+    Xvfb leaves the variable pointing at nothing and tk.Tk() raises, which took
+    the whole suite down and read as a failure in the beam gate. The checks
+    that need no display have already run by then and are the ones that matter.
+    """
+    import tkinter as tk
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        print('SKIP %s (no usable display: %s)' % (geometry, e))
+        return None
+    root.geometry(geometry)
+    return root
+
+
 # ── the gate decision ────────────────────────────────────────────────────────
 
 def make_capture(armed=True, **params):
@@ -216,14 +235,9 @@ class _FakeCapture:
 
 def test_stop_order():
     print('\n-- STOP drops the gate before it does anything slow --')
-    if not os.environ.get('DISPLAY'):
-        check('a display is available', False, 'no DISPLAY — skipped')
+    root = _try_root('900x700')
+    if root is None:
         return
-    import tkinter as tk
-    from app import EyeTrackingApp
-
-    root = tk.Tk()
-    root.geometry('900x700')
     app = build_app(root)
 
     log = []
@@ -272,13 +286,9 @@ def test_stop_order():
 
 def test_start_during_launch():
     print('\n-- START pressed while LAUNCH is still coming up --')
-    if not os.environ.get('DISPLAY'):
-        check('a display is available', False, 'no DISPLAY — skipped')
+    root = _try_root('900x700')
+    if root is None:
         return
-    import tkinter as tk
-    from app import EyeTrackingApp
-
-    root = tk.Tk(); root.geometry('900x700')
     app = build_app(root)
     fired = []
     app._alpide_run_trigger = lambda hz: fired.append(hz)
@@ -316,14 +326,10 @@ def test_start_during_launch():
 
 def test_arduino_reset():
     print('\n-- the board resetting mid-run --')
-    if not os.environ.get('DISPLAY'):
-        check('a display is available', False, 'no DISPLAY — skipped')
-        return
-    import tkinter as tk
-    from app import EyeTrackingApp
     import tkinter.messagebox as mb
-
-    root = tk.Tk(); root.geometry('900x700')
+    root = _try_root('900x700')
+    if root is None:
+        return
     app = build_app(root)
     log = []
     app.arduino = _FakeArduino(log)

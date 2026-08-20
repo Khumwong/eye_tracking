@@ -153,6 +153,70 @@ def test_min_off_hold():
           c._gate_open(True, now=t0 + 9.9) is False)
 
 
+def test_auto_latch():
+    print('\n-- the manual-resume latch outranks the eye, like the kill latch --')
+    c = make_capture(armed=True)
+    check('starts unlatched', c.auto_latched is False)
+
+    c.auto_latched = True
+    for trigger in (True, False, None):
+        check('latched: %r stays shut' % (trigger,),
+              c._gate_open(trigger) is False)
+
+    c.auto_latched = False
+    check('releasing hands the beam back to the eye',
+          c._gate_open(True) is True)
+
+    c.armed = False
+    c.auto_latched = True
+    check('latched and unarmed is still shut', c._gate_open(True) is False)
+
+
+def test_closed_by_eye():
+    print('\n-- only an eye-caused close trips the manual-resume latch --')
+    c = make_capture(armed=True)
+    check('off by default, regardless of kill_latched',
+          c._closed_by_eye() is False)
+    c.kill_latched = True
+    check('still off by default, even during a kill',
+          c._closed_by_eye() is False)
+    c.kill_latched = False
+
+    c.params['manual_resume'] = True
+    check('on, and no kill in force: this close is the eye\'s',
+          c._closed_by_eye() is True)
+
+    c.kill_latched = True
+    check('on, but KILL BEAM owns this close: not claimed here',
+          c._closed_by_eye() is False)
+
+
+def test_resume_request():
+    print('\n-- RESUME BEAM only takes effect while the eye is on target --')
+    c = make_capture(armed=True)
+
+    c.auto_latched = True
+    c.resume_requested = True
+    c._process_resume_request(False)
+    check('a request while off target is discarded, not queued',
+          c.auto_latched is True and c.resume_requested is False)
+
+    c.resume_requested = True
+    c._process_resume_request(None)
+    check('no face is treated the same as off target',
+          c.auto_latched is True and c.resume_requested is False)
+
+    c.resume_requested = True
+    c._process_resume_request(True)
+    check('a request while on target clears the latch',
+          c.auto_latched is False and c.resume_requested is False)
+
+    c.auto_latched = False
+    c._process_resume_request(True)
+    check('with nothing pending, an on-target frame does nothing on its own',
+          c.auto_latched is False)
+
+
 def test_min_off_disabled():
     print('\n-- setting it to zero restores the old behaviour --')
     c = make_capture(armed=True, min_off_s=0.0)
@@ -681,8 +745,7 @@ def test_ended_field():
           got == 'enable_off', 'got %r' % got)
 
     def _arduino_reset(app):
-        import tkinter.messagebox as mb
-        mb.showwarning = lambda *a, **k: None
+        app._show_warning = lambda *a, **k: None
         app._on_arduino_reset()
     got = run_case('/tmp/claude-1000/test_ended_arduino_reset', _arduino_reset)
     check("a board reset mid-run records ended='arduino_reset'",
@@ -763,7 +826,6 @@ def test_beam_used_counter():
 
 def test_arduino_reset():
     print('\n-- the board resetting mid-run --')
-    import tkinter.messagebox as mb
     root = _try_root('900x700')
     if root is None:
         return
@@ -775,7 +837,7 @@ def test_arduino_reset():
     app.input_mode.set('camera')
     app.ready = True
     warned = []
-    mb.showwarning = lambda *a, **k: warned.append(a)
+    app._show_warning = lambda *a, **k: warned.append(a)
 
     app._on_arduino_reset()
 
@@ -799,6 +861,9 @@ if __name__ == '__main__':
     test_gate()
     test_kill_latch()
     test_min_off_hold()
+    test_auto_latch()
+    test_closed_by_eye()
+    test_resume_request()
     test_min_off_disabled()
     test_chatter_is_absorbed()
     test_stop_order()

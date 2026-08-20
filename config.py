@@ -13,6 +13,51 @@ EAR_BLINK_THRESHOLD = 0.20   # eye aspect ratio below this = eyes closed (blink)
 DEFAULT_CENTER       = (320, 240)
 DEFAULT_THRESHOLD_MM = 3.0
 
+# Every frame is resized to this fraction of the camera's native resolution
+# immediately after capture — before detection, display, recording, or cuts
+# ever see it — so all four share one smaller frame instead of the full
+# 1920x1080. One idle FaceMesh instance alone measured ~260-280% sustained
+# CPU at full resolution on a 16-core machine; a synthetic benchmark (worst
+# case: no face in frame, forcing MediaPipe's expensive whole-frame detector
+# path on every call) showed 1920x1080 -> 960x540 cutting process() time from
+# ~18ms to ~4ms. The real win during continuous tracking of an actual face is
+# likely smaller, because MediaPipe's cheaper per-frame tracking mode (a
+# small fixed-size ROI crop around the previously-found face) doesn't scale
+# with whole-frame resolution the way the detector does — measure with the
+# real camera before trusting a number here.
+#
+# 1.0 = off (today's behaviour). Detection accuracy and the mm math are
+# unaffected by this value at any setting: deviation_mm is self-calibrating
+# from the iris radius measured at whatever resolution is in use, and every
+# coordinate consumer (target position, threshold circle, click-to-target)
+# derives its space from the frame actually in hand, not a fixed resolution
+# — see next.md for the investigation. Recorded video and on-screen picture
+# quality drop proportionally; that trade was confirmed acceptable.
+CAPTURE_DOWNSCALE = 1.0
+
+# The grayscale cross-check (a second FaceMesh instance, "second opinion"
+# comparison readout only — never touches trigger/threshold/Arduino, see
+# CaptureThread._detect_gray_iris) is one of two full FaceMesh instances
+# running during preview. Set False to skip creating it entirely — not just
+# throttle how often it runs — as a temporary way to shed that instance's
+# CPU/thread cost while a real independent second camera (see next.md,
+# "กล้องตัวที่สอง") isn't built yet. The comparison readout on screen shows
+# nothing while this is off; the primary detection path is untouched either
+# way.
+GRAY_CROSSCHECK_ENABLED = True
+
+# Preview (armed=False) has no latency to protect — nothing feeds
+# t_decided - t_capture or any beam decision while unarmed, since `armed`
+# gates that entirely. Capping the loop rate here only slows down the one
+# state that was never being measured, in exchange for not running full-rate
+# detection continuously before ENABLE/START are ever touched. Read live every
+# frame (CaptureThread._loop), so the UI entry takes effect immediately, not
+# just on the next preview open. 8 measured at ~163% CPU vs ~258% unthrottled
+# on a 16-core machine; 5 got to ~90% but visibly choppier; pick the value
+# that still feels smooth enough for setting Eye Selection/Threshold/Target
+# Position by eye.
+PREVIEW_FPS = 8
+
 # Once the beam has been cut, hold it off for at least this long before the eye
 # is allowed to reopen it. An eye sitting exactly on the threshold otherwise
 # chatters the shutter: 35 cuts in 26 s measured at 3.0 mm, and 19 off-periods

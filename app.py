@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 from datetime import datetime
 
 from PIL import Image, ImageTk
@@ -94,6 +94,9 @@ class EyeTrackingApp:
         self.detect_method  = tk.StringVar(value='facemesh')
         self.threshold_mm   = tk.DoubleVar(value=config.DEFAULT_THRESHOLD_MM)
         self.min_off_s      = tk.DoubleVar(value=config.DEFAULT_MIN_OFF_S)
+        self.manual_resume  = tk.BooleanVar(value=False)
+        self.gray_crosscheck = tk.BooleanVar(value=config.GRAY_CROSSCHECK_ENABLED)
+        self.preview_fps    = tk.IntVar(value=config.PREVIEW_FPS)
         self.input_mode     = tk.StringVar(value='camera')
         self.video_path     = tk.StringVar(value='')
         self.video_loop     = tk.BooleanVar(value=True)
@@ -112,8 +115,6 @@ class EyeTrackingApp:
         self.last_recording_path = ''
 
         self._display_scale = 1.0
-        self._display_ox    = 0
-        self._display_oy    = 0
         self._frame_w       = 640
         self._frame_h       = 480
 
@@ -123,12 +124,23 @@ class EyeTrackingApp:
         # adjusts the target, it never changes which view is main. See
         # CaptureThread._compose_display.
         self._last_view_meta = None
+        # UI-thread mirror of CaptureThread.auto_latched, updated only from
+        # _update_frame's metrics read — driving RESUME BEAM's visibility.
+        self._auto_latched = False
+        # Mirror of the raw per-frame trigger, same channel — lets
+        # _resume_beam warn immediately on a click about to be discarded
+        # instead of leaving the operator guessing why nothing happened.
+        self._eye_on_target = False
 
         self._p: dict = {
             'cx': config.DEFAULT_CENTER[0], 'cy': config.DEFAULT_CENTER[1],
             'side': 'left', 'speed': 1.0, 'loop': True,
             'detect_method': 'facemesh', 'threshold_mm': config.DEFAULT_THRESHOLD_MM,
             'min_off_s': config.DEFAULT_MIN_OFF_S,
+            'manual_resume': False,
+            'capture_downscale': config.CAPTURE_DOWNSCALE,
+            'gray_crosscheck': config.GRAY_CROSSCHECK_ENABLED,
+            'preview_fps': config.PREVIEW_FPS,
             'main_view': 'wide',
         }
         self._wire_params()
@@ -149,6 +161,7 @@ class EyeTrackingApp:
         self.detect_method.trace_add( 'write', lambda *_: s('detect_method', self.detect_method))
         self.threshold_mm.trace_add(  'write', lambda *_: s('threshold_mm',  self.threshold_mm))
         self.min_off_s.trace_add(     'write', lambda *_: self._sync_min_off())
+        self.preview_fps.trace_add(   'write', lambda *_: self._sync_preview_fps())
         self.playback_speed.trace_add('write', lambda *_: s('speed',         self.playback_speed))
         self.video_loop.trace_add(    'write', lambda *_: s('loop',    self.video_loop))
 
@@ -156,7 +169,7 @@ class EyeTrackingApp:
 
     def _maybe_start_preview(self):
         """Auto-open a live (unarmed) camera preview so Eye Selection, Threshold,
-        and Target Position can all be set by eye before READY/START are ever
+        and Target Position can all be set by eye before ENABLE/START are ever
         touched — the beam relay stays gated off regardless (see CaptureThread.armed)."""
         if self.input_mode.get() == 'camera' and not (self.capture and self.capture.running):
             self._open_capture(armed=False)
@@ -196,20 +209,6 @@ class EyeTrackingApp:
         return None
 
     # ── LED indicators ─────────────────────────────
-
-    def _led_make(self, parent, label):
-        f = tk.Frame(parent, bg=PANEL)
-        f.pack(fill=tk.X, pady=3)
-        c = tk.Canvas(f, width=12, height=12, bg=PANEL,
-                      highlightthickness=0)
-        c.pack(side=tk.LEFT, padx=(0, 8))
-        ov = c.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
-        tk.Label(f, text=label, bg=PANEL, fg=TEXT2,
-                 font=('Helvetica', 9)).pack(side=tk.LEFT)
-        self._lbl = tk.Label(f, text="—", bg=PANEL, fg=MUTEDT,
-                             font=('Helvetica', 9))
-        self._lbl.pack(side=tk.RIGHT)
-        return c, ov, self._lbl
 
     def _led_set(self, led_info, ok):
         c, ov, lbl = led_info
@@ -275,16 +274,6 @@ class EyeTrackingApp:
                          activeforeground=fg, relief='flat', cursor='hand2',
                          font=('Helvetica', 10, 'bold'), pady=10,
                          state=state, bd=0)
-
-    def _readout(self, parent, label, value, unit=''):
-        f = tk.Frame(parent, bg=CARD, padx=10, pady=6)
-        f.pack(fill=tk.X, padx=12, pady=2)
-        tk.Label(f, text=label, bg=CARD, fg=TEXT2,
-                 font=('Helvetica', 8)).pack(side=tk.LEFT)
-        lbl = tk.Label(f, text=f"{value}{unit}", bg=CARD, fg=CYANL,
-                       font=('Courier', 10, 'bold'))
-        lbl.pack(side=tk.RIGHT)
-        return lbl
 
     # ── Build UI ───────────────────────────────────
 
@@ -614,6 +603,48 @@ class EyeTrackingApp:
                                        font=('Courier', 9))
         self._minoff_entry.pack(side=tk.RIGHT)
 
+        # Off by default: existing auto-reopen (with or without the Min
+        # beam-off hold above) keeps working unchanged. When on, an
+        # eye-triggered cut latches shut — like KILL BEAM, but eye-caused
+        # rather than operator-caused — until RESUME BEAM is pressed, even
+        # once the eye is back on target. See CaptureThread._closed_by_eye.
+        arow = tk.Frame(inner, bg=PANEL)
+        arow.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self._resume_chk = tk.Checkbutton(
+            arow, text="Manual resume after cut", variable=self.manual_resume,
+            command=self._sync_manual_resume,
+            bg=PANEL, fg=TEXT2, selectcolor=INSET, activebackground=PANEL,
+            activeforeground=TEXT, font=('Helvetica', 9))
+        self._resume_chk.pack(side=tk.LEFT)
+
+        # On by default. Only gates the "second opinion" comparison readout —
+        # never the trigger/threshold/Arduino path (see
+        # CaptureThread._detect_gray_iris). Takes effect the next time
+        # preview opens (new CaptureThread), not instantly: the FaceMesh
+        # instance it controls is created once at thread start, the same way
+        # armed camera preview itself doesn't restart when you flip this.
+        grow = tk.Frame(inner, bg=PANEL)
+        grow.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self._gray_chk = tk.Checkbutton(
+            grow, text="Grayscale cross-check", variable=self.gray_crosscheck,
+            command=self._sync_gray_crosscheck,
+            bg=PANEL, fg=TEXT2, selectcolor=INSET, activebackground=PANEL,
+            activeforeground=TEXT, font=('Helvetica', 9))
+        self._gray_chk.pack(side=tk.LEFT)
+
+        # Only affects preview (armed=False) — read fresh every frame in the
+        # capture loop, so unlike the checkbox above this one takes effect
+        # immediately, no reopen needed. Never touches armed/latency at all.
+        pfrow = tk.Frame(inner, bg=PANEL)
+        pfrow.pack(fill=tk.X, padx=12, pady=(0, 8))
+        tk.Label(pfrow, text="Preview FPS", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        self._preview_fps_entry = tk.Entry(
+            pfrow, textvariable=self.preview_fps, width=6,
+            bg=INSET, fg=TEXT, insertbackground=TEXT,
+            relief='flat', justify='right', font=('Courier', 9))
+        self._preview_fps_entry.pack(side=tk.RIGHT)
+
         self._divider(inner)
 
         # ── DEBUG ────────────────────────────────────
@@ -749,6 +780,13 @@ class EyeTrackingApp:
                                         self._toggle_kill, MUTED, PANEL, MUTED,
                                         state=tk.DISABLED)
         self.kill_btn.pack(fill=tk.X, pady=(6, 0))
+
+        # Shown only while an eye-triggered latch (Manual resume after cut) is
+        # tripped — see _refresh_flow. Separate from kill_btn: this releases
+        # a cut the eye caused, not one the operator asked for.
+        self.resume_btn = self._flat_btn(ctrl, "↻   RESUME BEAM",
+                                          self._resume_beam, CARD, TEXT2, INSET)
+        self._resume_shown = False
 
         self._divider(right)
 
@@ -982,7 +1020,7 @@ class EyeTrackingApp:
         try:
             subprocess.Popen(['xdg-open', self.last_recording_path])
         except FileNotFoundError:
-            messagebox.showerror(
+            self._show_error(
                 "Review",
                 f"ไม่พบโปรแกรมเปิดวิดีโอ (xdg-open)\nไฟล์อยู่ที่:\n{self.last_recording_path}")
 
@@ -1149,7 +1187,7 @@ class EyeTrackingApp:
     # ── Ready check ─────────────────────────────────
     # Precondition gate (Arduino + camera connected) that also drives the DB9
     # Enable line (relay A) — mirrors KCMH-Tricker's Enable checkbox: a human
-    # must press READY before Enable asserts, and UNREADY drops it again,
+    # must tick ENABLE before Enable asserts, and unticking it drops it again,
     # instead of Enable being tied permanently high the moment the board has
     # power.
 
@@ -1161,12 +1199,12 @@ class EyeTrackingApp:
         enabling = self.enable_var.get()
         if enabling:
             if not self.arduino.is_connected:
-                messagebox.showwarning(
+                self._show_warning(
                     "Not connected", "Arduino ยังไม่เชื่อมต่อ กรุณาต่อ Arduino ก่อน")
                 self.enable_var.set(False)
                 return
             if not self._cam_ok:
-                messagebox.showwarning(
+                self._show_warning(
                     "Not connected", "กล้องยังไม่พร้อม กรุณาตรวจสอบกล้องก่อน")
                 self.enable_var.set(False)
                 return
@@ -1232,29 +1270,67 @@ class EyeTrackingApp:
         dlg.wait_window()
         return result['choice']
 
+    def _ack_dialog(self, title, message, kind):
+        """Single-button acknowledgment dialog, styled like the rest of the
+        app, replacing tkinter's unthemed messagebox.show*. Same construction
+        pattern as _confirm_disable_dialog: transient + grab_set for
+        modality, centered on root, WM_DELETE_WINDOW treated the same as
+        pressing OK, wait_window() so callers can call it exactly like
+        messagebox.show* did.
+        """
+        head_fg, btn_bg, btn_fg = (
+            (RED_TXT, REDB, REDL) if kind == 'error'
+            else (AMBER_TXT, AMBERB, AMBERL))
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.configure(bg=PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        tk.Label(dlg, text=title, bg=PANEL, fg=head_fg,
+                 font=('Helvetica', 10, 'bold'), padx=20, pady=14).pack()
+        tk.Label(dlg, text=message, bg=PANEL, fg=TEXT2, font=('Helvetica', 9),
+                 padx=20, justify='left').pack(pady=(0, 10))
+        btnf = tk.Frame(dlg, bg=PANEL)
+        btnf.pack(pady=(0, 14), padx=14)
+        tk.Button(btnf, text="OK", command=dlg.destroy,
+                  bg=btn_bg, fg=btn_fg, relief='flat', padx=16, pady=6,
+                  font=('Helvetica', 9, 'bold')).pack()
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width()  // 2 - dlg.winfo_width()  // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2 - dlg.winfo_height() // 2)
+        dlg.geometry(f"+{x}+{y}")
+        dlg.wait_window()
+
+    def _show_warning(self, title, message):
+        self._ack_dialog(title, message, kind='warning')
+
+    def _show_error(self, title, message):
+        self._ack_dialog(title, message, kind='error')
+
     # ── Start / Stop ───────────────────────────────
     # Camera preview (unarmed) and beam tracking (armed) share the same
     # CaptureThread loop — arming only gates whether it may ever send B1 to
     # the Arduino (see CaptureThread.armed). This lets Eye Selection,
     # Threshold, and Target Position all be set against a live picture
-    # before READY/START are touched, without the beam ever being reachable.
+    # before ENABLE/START are touched, without the beam ever being reachable.
 
     def _open_capture(self, armed):
         """Open the camera/video and start CaptureThread. armed=False is a
         preview-only session (beam relay stays gated off); armed=True is a
-        real tracking run and requires the caller to have checked READY."""
+        real tracking run and requires the caller to have ticked ENABLE."""
         is_video = self.input_mode.get() == 'video'
 
         if is_video:
             path = self.video_path.get().strip()
             if not path:
                 if armed:
-                    messagebox.showerror("No File", "Please select a video file first.")
+                    self._show_error("No File", "Please select a video file first.")
                 return
             self.cap = cv2.VideoCapture(path)
             if not self.cap.isOpened():
                 if armed:
-                    messagebox.showerror("Error", f"Cannot open video:\n{path}")
+                    self._show_error("Error", f"Cannot open video:\n{path}")
                 self._led_set(self._cam_led, False)
                 return
         else:
@@ -1283,6 +1359,11 @@ class EyeTrackingApp:
         # A latch set before this thread existed still applies to it: swapping
         # the camera or the source must not quietly hand the beam back.
         self.capture.kill_latched = self._killed
+        # Unlike kill_latched, an eye-triggered latch does not carry forward:
+        # a fresh run starts unlatched regardless of a prior run's state, and
+        # CaptureThread.__init__ already defaults auto_latched to False — this
+        # just keeps the UI mirror and the RESUME BEAM button in step with it.
+        self._auto_latched = False
         self.capture.start()
 
         self._refresh_flow()
@@ -1321,6 +1402,9 @@ class EyeTrackingApp:
         self._update_deviation_gray(None)
         self.video_progress.set(0)
         self.prog_lbl.config(text="--:-- / --:--")
+        # No new capture thread means no more metrics ticks to clear this —
+        # do it here so RESUME BEAM never lingers after the run it belonged to.
+        self._auto_latched = False
         self._p['main_view'] = 'wide'
         self._last_view_meta = None
         self.prog_slider.config(state=tk.DISABLED)
@@ -1344,6 +1428,9 @@ class EyeTrackingApp:
         self._fp_tab.config(state=state)
         self._threshold_scale.config(state=state)
         self._minoff_entry.config(state=state)
+        self._resume_chk.config(state=state)
+        self._gray_chk.config(state=state)
+        self._preview_fps_entry.config(state=state)
         self._trig_entry.config(state=state)
         if self.input_mode.get() == 'camera':
             self.record_chk.config(state=state)
@@ -1353,13 +1440,13 @@ class EyeTrackingApp:
 
     def start(self):
         if not self.ready:
-            messagebox.showerror("Not ready", "กรุณากด READY ก่อนเริ่ม tracking")
+            self._show_error("Not ready", "กรุณาติ๊ก ENABLE ก่อนเริ่ม tracking")
             return
         # A kill left latched from an earlier run would silently hold the beam
         # off through this one, looking exactly like an eye that never gets on
         # target. Refuse rather than start into that.
         if self._killed:
-            messagebox.showwarning(
+            self._show_warning(
                 "Beam killed",
                 "KILL BEAM ค้างอยู่ — กดปล่อยก่อนเริ่ม tracking")
             return
@@ -1495,13 +1582,16 @@ class EyeTrackingApp:
             self._update_precision_gray(metrics.get('iris_px_gray'))
             self._update_deviation_gray(metrics.get('deviation_mm_gray'))
             self._last_view_meta = metrics.get('view_meta')
+            al = metrics.get('auto_latched', False)
+            if al != self._auto_latched:
+                self._auto_latched = al
+                self._refresh_flow()
+            self._eye_on_target = metrics.get('on_target', False)
             self._frame_h, self._frame_w = frame.shape[:2]
             w = max(self.camera_label.winfo_width(),  640)
             h = max(self.camera_label.winfo_height(), 480)
             scale = min(w / self._frame_w, h / self._frame_h)
             self._display_scale = scale
-            self._display_ox = (w - int(self._frame_w * scale)) // 2
-            self._display_oy = (h - int(self._frame_h * scale)) // 2
             # Downscale with OpenCV before PIL ever sees the frame. The old
             # path (PIL fromarray on the full frame, then resize with LANCZOS)
             # measured 42 ms on a 1080p camera — more than the 30 ms this
@@ -1556,6 +1646,34 @@ class EyeTrackingApp:
         except (tk.TclError, ValueError):
             return
         self._p['min_off_s'] = max(0.0, min(self._MIN_OFF_MAX_S, v))
+
+    def _sync_manual_resume(self):
+        """Checkbutton callback: push the choice into the params the capture
+        thread reads. A discrete per-click callback, unlike min_off_s's
+        trace_add, because a Checkbutton has no half-typed intermediate state
+        to guard against."""
+        self._p['manual_resume'] = self.manual_resume.get()
+
+    def _sync_gray_crosscheck(self):
+        """Checkbutton callback. Only takes effect the next time preview
+        (re)opens — CaptureThread creates its FaceMesh instances once at
+        thread start, not per frame, so flipping this mid-session changes
+        nothing until a fresh capture thread exists."""
+        self._p['gray_crosscheck'] = self.gray_crosscheck.get()
+
+    _PREVIEW_FPS_MAX = 30
+
+    def _sync_preview_fps(self):
+        """Push the typed rate into the params the capture thread reads —
+        checked fresh every frame while unarmed (CaptureThread._loop), so
+        unlike gray_crosscheck this takes effect immediately. Same half-typed
+        guard as _sync_min_off: leave the last good value in force rather
+        than throwing or resetting on '' mid-edit."""
+        try:
+            v = int(self.preview_fps.get())
+        except (tk.TclError, ValueError):
+            return
+        self._p['preview_fps'] = max(1, min(self._PREVIEW_FPS_MAX, v))
 
     def _min_off_value(self):
         """Read, clamp and write back — called at START so the box agrees with
@@ -1716,6 +1834,7 @@ class EyeTrackingApp:
             'detect_method':  self.detect_method.get(),
             'threshold_mm':   self.threshold_mm.get(),
             'min_off_s':      self._p.get('min_off_s', config.DEFAULT_MIN_OFF_S),
+            'manual_resume':  self._p.get('manual_resume', False),
             'target_x':       self.center_x.get(),
             'target_y':       self.center_y.get(),
             'trigger_hz':     self.trigger_hz.get(),
@@ -1754,6 +1873,11 @@ class EyeTrackingApp:
                 camera['width']  = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 camera['height'] = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             camera['nominal_fps'] = round(self._video_fps, 2)
+            # width/height above are the camera's native resolution, not
+            # necessarily what detection/recording actually used — this says
+            # so, rather than letting a downscaled run look identical to a
+            # full-res one.
+            camera['capture_downscale'] = self._p.get('capture_downscale', 1.0)
         except Exception:
             pass
         try:
@@ -2075,6 +2199,17 @@ class EyeTrackingApp:
             self._paint(self.kill_btn, "✕   KILL BEAM",
                         self._DANGER if self.ready else self._OFF, self.ready)
 
+        # RESUME BEAM — outside the numbering, like KILL BEAM; appears only
+        # while the eye-triggered latch (Manual resume after cut) is tripped.
+        show_resume = self._auto_latched
+        if show_resume and not self._resume_shown:
+            self.resume_btn.pack(fill=tk.X, pady=(6, 0), after=self.kill_btn)
+        elif self._resume_shown and not show_resume:
+            self.resume_btn.pack_forget()
+        self._resume_shown = show_resume
+        if show_resume:
+            self._paint(self.resume_btn, "↻   RESUME BEAM", self._DONE, True)
+
     def _set_launch_state(self, state):
         """UI thread only. 'idle' | 'launching' | 'ready' | 'locked'."""
         self._launch_state = state
@@ -2114,6 +2249,29 @@ class EyeTrackingApp:
         # claiming a kill that is no longer in force.
         self._beam_off()
         self.log('[BEAM] kill released')
+
+    def _resume_beam(self):
+        """Request that the eye-triggered latch (Manual resume after cut) be
+        cleared. Only a request, not a guaranteed clear: the capture thread
+        honours it solely on a frame where the eye is presently on target
+        (CaptureThread._process_resume_request) — a click while it is still
+        off target is discarded there rather than queued, so RESUME BEAM
+        cannot arm an unattended reopen for whenever the eye later happens to
+        drift back. The button's own visibility follows the next metrics tick
+        in _update_frame, not immediately: unlike _toggle_kill, reopening has
+        no urgency that would justify skipping ahead of the capture thread.
+
+        Warns rather than silently doing nothing when the eye is off target —
+        _process_resume_request would discard the request anyway, and a
+        click with no visible effect at all reads as broken, not refused."""
+        if not self._eye_on_target:
+            self._show_warning(
+                "ยังกด resume ไม่ได้",
+                "ตายังไม่อยู่ในเป้า — รอให้ตากลับเข้าเป้าก่อนแล้วกดใหม่")
+            return
+        if self.capture:
+            self.capture.resume_requested = True
+        self.log('[BEAM] manual resume requested by operator')
 
     def _alpide_open_dir(self):
         """Bind this run's output folder. Whichever of LAUNCH or START happens
@@ -2499,13 +2657,13 @@ class EyeTrackingApp:
         self._release_kill()
         self._daq_teardown()             # a launch left up behind Enable coming down
         self._set_launch_state('locked')
-        self._alpide_note('Arduino รีเซ็ต — กด READY ใหม่')
-        messagebox.showwarning(
+        self._alpide_note('Arduino รีเซ็ต — ติ๊ก ENABLE ใหม่')
+        self._show_warning(
             "Arduino reset",
             "บอร์ดรีสตาร์ทระหว่างใช้งาน (ไฟตก/สายหลุด)\n\n"
             "รีเลย์ตกสู่สถานะปลอดภัยแล้ว และตัวนับพัลส์ถูกล้าง — "
             "ข้อมูลของ run นี้เทียบเวลากับ ALPIDE ไม่ได้\n\n"
-            "กด READY ใหม่ก่อนเริ่ม run ถัดไป")
+            "ติ๊ก ENABLE ใหม่ก่อนเริ่ม run ถัดไป")
 
     # ── Watchdog heartbeat ─────────────────────────
     # The Arduino drops both relays if it hears nothing for WATCHDOG_MS (see

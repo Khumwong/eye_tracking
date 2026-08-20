@@ -368,6 +368,16 @@ show_group = armed or launching or self._daq_ready or self._alpide_pid is not No
 
 **ไม่ทำ Auto kill beam** — ของ Kcmh-Tricker ตัดที่ 10 วินาทีเพราะแอปเขาเป็นคนสั่งยิงเอง จึงเป็นคนตัดเองได้ **run ของเราก็มีจุดจบที่กำหนดไว้ล่วงหน้าเหมือนกัน คือบีมที่ขอมาต้องยิงให้หมด** (ช่วงทดลองขอสั้นๆ ไม่เกิน 10-20 วินาที) แต่**จุดจบนั้นเป็นของ TSS ไม่ใช่ของเรา** — โดสนับเป็น MU ไม่ใช่วินาที TSS หยุดเองเมื่อครบ timer ในแอปจึงไม่ใช่ตัวคุมโดสและไม่ควรทำหน้าที่นั้น
 
+### Manual resume after cut — RESUME BEAM
+
+checkbox **"Manual resume after cut"** ใต้ Min beam-off (default ปิด) เปลี่ยนพฤติกรรมขาเปิดของ gate: ปกติบีมเปิดเองทันทีที่ตากลับเข้าเป้า (ผ่าน min beam-off เท่านั้น) — ติ๊กตัวนี้แล้ว **บีมที่ถูกตัดเพราะตาหลุดเป้าจะไม่เปิดเองอีก แม้ตาจะกลับเข้าเป้าแล้วก็ตาม** ต้องกด **RESUME BEAM** เอง
+
+ใช้กลไก latch แบบเดียวกับ KILL BEAM (`CaptureThread.auto_latched`) แต่เป็นคนละ flag กัน เพราะความหมายต่างกัน: KILL BEAM = operator สั่งตัด ปลดด้วยการกด KILL BEAM ซ้ำ / ตัวนี้ = ตาสั่งตัดเอง (เฉพาะตอน checkbox ติ๊ก) ปลดด้วย RESUME BEAM — แยกกันเพื่อให้ `cuts.csv`/`track.csv` บอกเหตุตัดได้ถูก (`reason=kill` ต่างจาก `reason=latched`) และปุ่ม KILL BEAM ไม่ไปอ้างสิทธิ์ตัดที่ตาเป็นคนสั่ง (`CaptureThread._closed_by_eye()`)
+
+**RESUME BEAM มีผลก็ต่อเมื่อตาอยู่ในเป้าตอนกดเท่านั้น** (`CaptureThread._process_resume_request()`) — กดตอนตายังหลุดอยู่ ระบบทิ้งคำขอเงียบๆ ไม่ใช่จดจำไว้เปิดทีหลังเอง ถ้าจำไว้ operator ที่คลิกไปก่อนแล้วเดินจากไปจะได้บีมเปิดเองตอนตาเผลอกลับเข้าเป้าโดยไม่มีใครยืนยัน ขัดกับจุดประสงค์ทั้งหมดของฟีเจอร์นี้ — กดตอนตาหลุดเป้าจะขึ้น dialog เตือนแทนที่จะเงียบเฉยๆ
+
+ปุ่มขึ้นสีเขียว (`_DONE`) เฉพาะตอน latch ติดอยู่จริง ค่า `manual_resume` บันทึกลง `session.json` ทุก run
+
 ### `beam used` — เวลาบีมติดสะสม
 
 ป้าย BEAM มีบรรทัด `beam used  N.N s` นับ**เฉพาะเวลาที่ชัตเตอร์เปิดจริง**
@@ -406,6 +416,14 @@ palette ใน `config.py` ใช้ค่าจาก `GLOBAL_STYLE` ของ 
 | `*_TXT` | สีเดียวกันแต่ใช้เป็น**ตัวหนังสือบนพื้นสว่าง** |
 
 ตอนเป็น dark theme ค่าเดียวรับได้ทั้งสองบทบาท เพราะตัวอ่อนสว่างพอจะอ่านออกบนพื้นมืด พอเปลี่ยนเป็นพื้นสว่างมันขัดกันทันที — ตัวหนังสือบนขาวต้องเข้ม แต่บนปุ่มสีจัดต้องอ่อน `MUTED` (พื้นปุ่ม disabled) กับ `MUTEDT` (ตัวหนังสือจาง) ก็แยกด้วยเหตุผลเดียวกัน
+
+### Dialog เตือน ใช้ธีมเดียวกับแอป ไม่ใช่ของ OS
+
+`tkinter.messagebox` เรนเดอร์ด้วยธีมของ OS เสมอ ไม่รับสีที่แอปกำหนดเอง — เดิมมี 9 จุดในแอปที่เรียกมันตรงๆ (`showwarning`/`showerror`) หน้าตาเลยหลุดจากส่วนที่เหลือทั้งหมด
+
+`_ack_dialog()` (คู่กับ `_confirm_disable_dialog` ที่มีอยู่ก่อนแล้ว) เป็น `tk.Toplevel` ที่ก็อปแพทเทิร์นเดียวกัน — พื้น `PANEL`, ปุ่ม OK สีตามความรุนแรง (`REDB` สำหรับ error, `AMBERB` สำหรับ warning), จัดกลางหน้าต่างหลัก, กด X ก็ปิดได้เหมือนกด OK, blocking ผ่าน `wait_window()` เหมือนของเดิม `_show_warning()`/`_show_error()` เป็นตัวห่อบางๆ เรียกแทน `messagebox.showwarning`/`showerror` ทุกจุด — import `messagebox` ถูกตัดออกจาก `app.py` แล้วเพราะไม่มีที่ไหนเรียกอีก
+
+เทสต์ที่เคย monkeypatch `tkinter.messagebox` (กัน dialog บล็อกตอนรันอัตโนมัติ) เปลี่ยนไป patch `app._show_warning` แทน — วิธีเดียวกับที่ `_confirm_disable_dialog` ถูก mock อยู่แล้วใน `test_beam_gate.py`
 
 ### สี FLOW บอกว่าต้องกดอะไรต่อ
 
@@ -455,6 +473,7 @@ palette ใน `config.py` ใช้ค่าจาก `GLOBAL_STYLE` ของ 
 | **STOP** | disarm → หยุด EUDAQ2 + ปิด CSV + หยุด RECORD | `B0` `T0` |
 | ☐ **ENABLE** (ปลด) | หยุด EUDAQ2 ที่ค้างอยู่ด้วย | (`B0`) `E0` |
 | **KILL BEAM** | latch | `B0` |
+| **RESUME BEAM** | ปลด auto-latch — เฉพาะตอนตาอยู่ในเป้าตอนกด (ดูหัวข้อ Manual resume after cut) | — ไม่ส่งอะไร |
 
 **START ที่ไม่ได้ผ่าน LAUNCH ไม่รอให้ EUDAQ2 ขึ้นก่อน arm** — EUDAQ2 ใช้เวลา ~10 วินาทีจึงพร้อม การหน่วงบีมไว้นานเท่านั้นแย่กว่าการเสียข้อมูลช่วงต้นไม่กี่วินาที และ transition ที่จะวัดเกิดซ้ำตลอด run อยู่แล้ว (ทางที่ถูกคือกด LAUNCH ตอนเซ็ตอัพแล้วรอ ซึ่งตอนนี้ flow บังคับให้อยู่แล้ว — `start without DAQ` มีไว้เฉพาะตอน ALPIDE ใช้งานไม่ได้)
 
@@ -471,9 +490,23 @@ palette ใน `config.py` ใช้ค่าจาก `GLOBAL_STYLE` ของ 
 
    เดิมเช็คแค่ "มี session ไหม" ซึ่งทำให้**ซากที่ตายแล้วบล็อกทุก run ถัดไปเงียบๆ** — แอปยังเขียนไฟล์ครบ ดูปกติทุกอย่าง แต่ไม่มี `.raw` เลย และรู้ตัวตอนมาวิเคราะห์ (เสีย run 59 วินาทีไปหนึ่งครั้ง)
 
+### ประสิทธิภาพ CPU — preview กินไปเท่าไหร่ และแก้อะไรไปแล้ว
+
+จุดเริ่ม: ผู้ใช้รายงานว่าเปิดแอปแล้วบางทีเมาส์/คีย์บอร์ดทั้งเครื่องหน่วง — วัดจริงพบว่าแค่ **preview เฉยๆ (ยังไม่ติ๊ก ENABLE)** กิน **~330-345% CPU และ ~101 threads** บนเครื่อง 16 คอร์ ต่อเนื่อง สาเหตุคือ MediaPipe FaceMesh (ผ่าน TFLite/XNNPACK) สร้าง thread pool ภายในขนาดเท่าจำนวนคอร์ทั้งหมด**โดย default** และ `capture.py` สร้าง FaceMesh **สองตัวพร้อมกัน** (หลัก + grayscale cross-check) ทุกครั้งที่เปิดกล้อง — สร้างเฉยๆ ไม่ทำอะไรก็กิน 64 threads/127% CPU ต่อตัวแล้ว (วัดแยกด้วยสคริปต์เปล่า)
+
+แก้ไปแล้ว 4 จุด เรียงจากกระทบน้อยสุด:
+
+1. **`os.environ.setdefault('OMP_NUM_THREADS', '2')`** ใน `main.py` (ต้องตั้ง**ก่อน** `from app import ...` เพราะต้องมีผลก่อน FaceMesh instance แรกถูกสร้าง) — วัด latency ต่อเฟรมจริงแล้วไม่ต่างกันเลย (12.4 → 13.0 ms) เพราะ MediaPipe ไม่ได้ประโยชน์จาก thread เกิน 2-4 ตัวสำหรับเฟรมเดียวอยู่แล้ว ลด thread ของ 2 instances จาก 83 → 55 แต่ CPU ตอนสร้างเฉยๆ ลดจาก 129% → 54%
+2. **`_GRAY_EVERY_N` (capture.py) 3 → 30** — grayscale cross-check เป็นแค่ตัวเลขเทียบให้ operator ดู ไม่ต้องอัปเดตทุก 3 เฟรม (~9 Hz) ทุก 30 เฟรม (~1 Hz) ก็ยังไวพอตา
+3. **`config.GRAY_CROSSCHECK_ENABLED`** (checkbox "Grayscale cross-check" ในแอป, default เปิด) — ปิดแล้วข้ามการสร้าง FaceMesh ตัวที่สองไปเลย ไม่ใช่แค่ throttle **มีผลตอนเปิด preview ครั้งถัดไปเท่านั้น** เพราะ instance ถูกสร้างครั้งเดียวตอน thread เริ่ม ไม่ได้เช็คทุกเฟรม — วัดแล้ว CPU แทบไม่ลด (258%→255%, throttle ข้อ 2 ทำงานอยู่แล้ว) แต่ **thread ลดจาก 73→54** ซึ่งน่าจะช่วยเรื่อง scheduler contention ที่ทำให้เครื่อง lag มากกว่าตัวเลข %CPU เฉยๆ
+4. **`config.CAPTURE_DOWNSCALE`** (default `1.0` = ปิด, ไม่มี UI) — resize ทั้งเฟรม**ครั้งเดียว**ทันทีหลัง `cap.read()` ก่อนอะไรทั้งนั้นจะแตะ ทำให้ detection/display/recording/cuts ใช้เฟรมเล็กเดียวกันหมด (ไม่ใช่แยก "ตรวจจับเล็ก แต่แสดงผลใหญ่" เพราะผู้ใช้ยืนยันว่าคุณภาพภาพไม่สำคัญ ขอแค่ค่า mm/latency ถูก) วัดจริงที่ 0.5: **258%→196% CPU** ลอง 0.25 ได้แค่ 188% (ชนเพดานแล้ว ไม่คุ้มลดต่ำกว่า 0.5) ปลอดภัยต่อความแม่นยำเพราะ MediaPipe คืนพิกัดแบบ normalized [0,1] และทุกจุดที่ใช้พิกัด (target position, threshold circle, click-to-target) derive สเกลจาก `frame.shape` ที่มีอยู่จริงอยู่แล้ว ไม่มีจุดไหน hardcode 1920×1080 — `session.json` บันทึก `camera.capture_downscale` ไว้ด้วยกัน provenance ไม่โกหก ไม่มี UI เพราะเป็นการตัดสินใจระดับ campaign เหมือน `TRIGGER_HZ` ด้านล่าง ไม่ควรเผลอกดกลางเซสชัน
+5. **`config.PREVIEW_FPS`** (ช่องกรอกตัวเลขในแอป, default `8`) — จำกัด frame rate เฉพาะตอน **`not self.armed`** (preview เฉยๆ) เท่านั้น อ่านค่าสดทุกเฟรมจึงมีผลทันทีที่พิมพ์ ไม่ต้องเปิด preview ใหม่ — **ตอน armed (วัดจริง) ไม่ถูกแตะเลย ข้ามเงื่อนไขนี้ไปตรงๆ** latency ที่วัดจึงไม่เปลี่ยนแม้แต่นิดเดียว วัดจริง: 12 fps ลดน้อยกว่าคาด (258%→240%, สปีดธรรมชาติของ loop ต่ำกว่านั้นอยู่แล้ว), **8 fps → 163%**, 5 fps → 90% แต่ภาพกระตุกเห็นชัด
+
+**รวมทุกอย่าง (0.5 + ปิด gray cross-check): CPU เหลือ ~200-204%** จากจุดเริ่มต้น ~330-345% — ลดได้จริงประมาณ 40% แต่ยังเหลือ**เพดาน ~190-200%** ที่ไม่ขึ้นกับตัวแปรพวกนี้แล้ว (น่าจะเป็น baseline ของ Python/Tk/GC/MediaPipe เอง) ถ้าต้องการลด lag เพิ่มอีก ทางที่เหลือไม่ใช่โค้ดของแอปนี้แล้ว — ดู next.md (ปิดแอปอื่นตอนใช้งานจริง, เครื่องแยกสำหรับวัด, หรือกล้องตัวที่สองบน Raspberry Pi ที่จะย้าย gray cross-check ออกจากเครื่องหลักไปเลย)
+
 ### ค่าที่ตั้งใน `config.py`
 
-`ALPIDE_NUM`, `ALPIDE_EVENTS`, `ALPIDE_STROBE`, `ALPIDE_ITHR`, `TRIGGER_HZ`, `TRIGGER_DUTY`, `KCMH_TRICKER_DIR`, `EUDAQ_DIR`, `EUDAQ_LIB`, `ITS3_POLL_MS`, `CUT_QUEUE_MAX`, `CUT_JPEG_QUALITY`, `CUT_MAX_PER_SESSION` — อยู่ในไฟล์ไม่ใช่ UI เพราะเปลี่ยนตาม campaign ไม่ใช่ตาม session (มีแค่ความถี่ trigger ที่โผล่มาใน UI เพราะต้องปรับหน้างาน)
+`ALPIDE_NUM`, `ALPIDE_EVENTS`, `ALPIDE_STROBE`, `ALPIDE_ITHR`, `TRIGGER_HZ`, `TRIGGER_DUTY`, `KCMH_TRICKER_DIR`, `EUDAQ_DIR`, `EUDAQ_LIB`, `ITS3_POLL_MS`, `CUT_QUEUE_MAX`, `CUT_JPEG_QUALITY`, `CUT_MAX_PER_SESSION`, **`CAPTURE_DOWNSCALE`** — อยู่ในไฟล์ไม่ใช่ UI เพราะเปลี่ยนตาม campaign ไม่ใช่ตาม session (มีแค่ความถี่ trigger ที่โผล่มาใน UI เพราะต้องปรับหน้างาน) — `GRAY_CROSSCHECK_ENABLED`/`PREVIEW_FPS` เป็นข้อยกเว้น: มี UI แล้ว (checkbox/ช่องกรอกในแอป) เพราะไม่ใช่การตัดสินใจ safety-critical เหมือนตัวอื่นในกลุ่มนี้ ดูหัวข้อ "ประสิทธิภาพ CPU" ด้านบน
 
 `alpide_daq.py` **import โมดูลของ Kcmh-Tricker ตรงๆ ไม่ copy** — logic การ generate config ที่นั่นมีค่าคงที่ของฮาร์ดแวร์จริง (serial ของ DAQ 6 ตัว, ตาราง VCASN/VCASN2, `EUDAQ_FW_PATTERN`) ถ้า copy มาจะ drift จากกันเงียบๆ
 

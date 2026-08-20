@@ -51,6 +51,16 @@ class CaptureThread:
         # which is likewise a state the run cannot overrule rather than a
         # one-shot command.
         self.kill_latched = False
+        # Same shape as kill_latched but eye-triggered rather than operator-
+        # triggered, and with a different writer: this thread sets it True the
+        # moment an eye-caused close happens (only when params['manual_resume']
+        # is on — see _closed_by_eye), so the beam does not auto-reopen even
+        # once the eye is back on target. The main thread never writes this
+        # directly; it only requests a clear via resume_requested, the same
+        # ownership split Kcmh-Tricker style code elsewhere in this class uses
+        # to avoid needing a lock between the two threads.
+        self.auto_latched = False
+        self.resume_requested = False
         # When the beam was last closed, for the minimum-off hold in
         # _gate_open. None means "not since this thread started", so the first
         # open of a run is never delayed.
@@ -73,12 +83,14 @@ class CaptureThread:
         # copy of the frame with its own FaceMesh pass, throttled (see
         # _GRAY_EVERY_N) since running detection twice per frame is expensive.
         # Purely observational — never read by the trigger/threshold/Arduino
-        # path, only by the comparison readouts and the zoom_gray view.
+        # path, only by the comparison readouts. zoom_gray's own crop is
+        # anchored on _last_good_iris (the color reading), not this one —
+        # both zoom sub-views share one crop region driven by the primary
+        # detection, so the gray pass never needs its own anchor.
         self._last_iris_px_gray      = None
         self._last_iris_x_gray       = None
         self._last_iris_y_gray       = None
         self._last_deviation_mm_gray = None
-        self._last_good_iris_gray    = None
         self._frame_idx = 0
 
         self._strip_deque = collections.deque(maxlen=100)
@@ -140,9 +152,20 @@ class CaptureThread:
     def seek_to(self, frame_num: int):
         self._seek = frame_num
 
-    def start_recording(self, path: str):
+    def _scaled_frame_size(self):
+        """(w, h) after CAPTURE_DOWNSCALE — the single source of truth both
+        the per-frame resize in _loop() and the VideoWriter here must agree
+        on, so a rounding mismatch between the two can never corrupt a
+        recording."""
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        scale = self.params.get('capture_downscale', 1.0)
+        if scale >= 1.0:
+            return w, h
+        return int(w * scale), int(h * scale)
+
+    def start_recording(self, path: str):
+        w, h = self._scaled_frame_size()
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         with self._writer_lock:
             self._writer = cv2.VideoWriter(path, fourcc, self._fps, (w, h))
@@ -207,6 +230,8 @@ class CaptureThread:
             return 'unarmed'
         if self.kill_latched:
             return 'kill'
+        if self.auto_latched:
+            return 'latched'
         if trigger is None:
             return 'no_face'
         if trigger is False:
@@ -379,7 +404,16 @@ class CaptureThread:
 
     # ── Internal loop ─────────────────────────────────────────
 
-    _GRAY_EVERY_N = 3   # throttle: run the grayscale cross-check every Nth frame
+    # A comparison readout only needs to be human-legible, not frame-accurate —
+    # was 3 (~9 Hz at typical camera fps), now 30 (~1 Hz), which is still
+    # instant to the eye but a small win against the per-frame cost of running
+    # a second FaceMesh pass. Measured smaller than expected: the primary
+    # color-model FaceMesh pass (never throttled, runs every frame regardless)
+    # dominates idle-preview CPU on its own (~260-280% sustained on a 16-core
+    # machine, before ENABLE/START are ever touched) — cutting this throttle
+    # further would not move that number much. See next.md if that CPU floor
+    # itself needs addressing (camera resolution is the actual lever).
+    _GRAY_EVERY_N = 30   # throttle: run the grayscale cross-check every Nth frame
     _BEAM_REFRESH_N = 10  # re-send the unchanged beam state every Nth frame
 
     def _loop(self):
@@ -389,9 +423,17 @@ class CaptureThread:
             face_mesh = mp.solutions.face_mesh.FaceMesh(
                 max_num_faces=1, refine_landmarks=True,
                 min_detection_confidence=0.5, min_tracking_confidence=0.5)
-            face_mesh_gray = mp.solutions.face_mesh.FaceMesh(
-                max_num_faces=1, refine_landmarks=True,
-                min_detection_confidence=0.5, min_tracking_confidence=0.5)
+            # Skipped entirely (not just throttled) when the comparison
+            # readout is turned off — this is a second full FaceMesh
+            # instance, and not creating it at all sheds its idle thread-pool
+            # cost too, not just the per-frame process() cost _GRAY_EVERY_N
+            # already throttles. Every call site below already guards on
+            # `face_mesh_gray` being truthy, so leaving it None here is
+            # enough — nothing else needs to change.
+            if self.params.get('gray_crosscheck', True):
+                face_mesh_gray = mp.solutions.face_mesh.FaceMesh(
+                    max_num_faces=1, refine_landmarks=True,
+                    min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
         frame_delay = 1.0 / self._fps
 
@@ -423,6 +465,13 @@ class CaptureThread:
 
                 if not self.is_video:
                     frame = cv2.flip(frame, 1)
+
+                # After t_capture, deliberately: this cost is a real part of
+                # the pipeline now, and must show up honestly in
+                # t_decided - t_capture rather than being hidden from it.
+                size = self._scaled_frame_size()
+                if size != (frame.shape[1], frame.shape[0]):
+                    frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
                 raw = frame.copy()
 
@@ -464,6 +513,8 @@ class CaptureThread:
 
                 frame, view_meta = self._compose_display(frame, gray_bgr, center, trigger)
 
+                self._process_resume_request(trigger)
+
                 armed_trigger = self._gate_open(trigger)
                 if armed_trigger and self.current_state != 'O':
                     self.arduino.send(b'B1\n')
@@ -472,6 +523,8 @@ class CaptureThread:
                     self.arduino.send(b'B0\n')
                     self.current_state = 'S'
                     self._beam_off_since = time.monotonic()
+                    if self._closed_by_eye():
+                        self.auto_latched = True
                     # After the relay command, never before it: the snapshot is
                     # evidence about the beam cut, not part of causing it. Only
                     # on the transition — the periodic refresh below re-states a
@@ -522,6 +575,12 @@ class CaptureThread:
                         'iris_px_gray':      self._last_iris_px_gray,
                         'deviation_mm_gray': self._last_deviation_mm_gray,
                         'view_meta':    view_meta,
+                        'auto_latched': self.auto_latched,
+                        # What _process_resume_request will check a RESUME
+                        # BEAM click against — lets the UI warn immediately
+                        # on a click that is about to be discarded, instead
+                        # of leaving the operator guessing why nothing happened.
+                        'on_target':    bool(trigger),
                     }
                     try:
                         self.queue.put_nowait(
@@ -537,6 +596,11 @@ class CaptureThread:
 
                 if self.is_video:
                     dt = (frame_delay / self.params.get('speed', 1.0)) - (time.time() - t0)
+                    if dt > 0:
+                        time.sleep(dt)
+                elif not self.armed:
+                    preview_fps = self.params.get('preview_fps', config.PREVIEW_FPS)
+                    dt = (1.0 / preview_fps) - (time.time() - t0)
                     if dt > 0:
                         time.sleep(dt)
         finally:
@@ -705,14 +769,46 @@ class CaptureThread:
         5 s hold. The dose still has to reach the same MU either way, so a low
         duty cycle is paid for in how long the patient is held in position. The
         right value is a clinical judgement — see next.md.
+
+        auto_latched behaves like kill_latched here: it only ever blocks
+        opening, never independently closes an already-open beam. It gets set
+        elsewhere, at the moment of an eye-triggered close (_closed_by_eye),
+        not read from here.
         """
-        if not (trigger and self.armed and not self.kill_latched):
+        if not (trigger and self.armed and not self.kill_latched
+                and not self.auto_latched):
             return False
         hold = self.params.get('min_off_s', config.DEFAULT_MIN_OFF_S)
         if hold and self._beam_off_since is not None:
             if (now or time.monotonic()) - self._beam_off_since < hold:
                 return False
         return True
+
+    def _closed_by_eye(self):
+        """True when a beam closure right now should trip the manual-resume
+        latch: the option is on, and this isn't a closure KILL BEAM already
+        owns (KILL BEAM has its own release flow and must not also be claimed
+        by the RESUME BEAM control)."""
+        return self.params.get('manual_resume', False) and not self.kill_latched
+
+    def _process_resume_request(self, trigger):
+        """Consume a pending RESUME BEAM click, if any.
+
+        Only clears auto_latched when the eye is on target on this exact
+        frame. A click while it is still off target is discarded here, not
+        queued — queuing it would let one early click reopen the beam
+        unattended whenever the eye later happened to drift back onto target,
+        defeating the reason this latch exists. The operator must see it on
+        target and click again.
+
+        Kept as its own method, like _gate_open, so this can be tested
+        without a camera.
+        """
+        if not self.resume_requested:
+            return
+        self.resume_requested = False
+        if trigger:
+            self.auto_latched = False
 
     def _within_threshold(self, ex, ey, ir, center):
         """Return (triggered, deviation_mm). Uses iris size to convert px → mm."""
@@ -787,7 +883,6 @@ class CaptureThread:
         trigger/threshold/Arduino state, only _last_*_gray for display."""
         results = face_mesh_gray.process(cv2.cvtColor(gray_bgr, cv2.COLOR_BGR2RGB))
         if not results.multi_face_landmarks:
-            self._last_good_iris_gray    = None
             self._last_iris_px_gray      = None
             self._last_iris_x_gray       = None
             self._last_iris_y_gray       = None
@@ -806,7 +901,6 @@ class CaptureThread:
         self._last_iris_px_gray      = ir * 2
         self._last_iris_x_gray       = ix
         self._last_iris_y_gray       = iy
-        self._last_good_iris_gray    = (ix, iy, ir)
         self._last_deviation_mm_gray = detection.deviation_mm(ix, iy, ir, center)
 
     def _draw_strip_chart(self, frame):

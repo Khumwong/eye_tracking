@@ -1,7 +1,21 @@
-import faulthandler
 import os
+
+# MediaPipe's FaceMesh (TFLite/XNNPACK) sizes its internal thread pool to
+# every available core by default, with no way to configure it through the
+# solutions API used in capture.py. Measured on a 16-core machine: one idle
+# FaceMesh instance alone spins up 64 threads at 127% CPU, and capture.py
+# creates two of them (main detection + the grayscale cross-check) every time
+# the camera preview opens — well before anyone arms tracking. Capping this
+# costs nothing measurable in per-frame latency (12.4ms -> 13.0ms measured)
+# while cutting CPU/thread count by more than half; the excess threads beyond
+# a handful were pure overhead, not real parallelism a single-frame inference
+# benefits from. Must be set before the first FaceMesh() call, deep inside
+# CaptureThread, so this has to run before `from app import ...` below pulls
+# capture.py in.
+os.environ.setdefault('OMP_NUM_THREADS', '2')
+
+import faulthandler
 import signal
-import sys
 import tkinter as tk
 from app import EyeTrackingApp
 

@@ -857,6 +857,34 @@ def test_arduino_reset():
     teardown(app, root)
 
 
+def _cleanup_stray_alpide_session():
+    """Safety net after the whole suite runs. None of these tests drive a
+    real LAUNCH DAQ — every _alpide_pid set above is a fake int, and
+    _alpide_stop is monkeypatched away wherever it matters (see
+    _trace_alpide_stop) — so this suite should never itself bring up the
+    real ITS3 tmux session. But it runs right next to whatever the operator
+    has open in the real app, so if a session is up when the suite ends,
+    only clear it when it's 'stale' (a crashed/finished run's leftover
+    shell — see alpide_daq.session_state's own docstring for why that's the
+    one state that's safe to clear unconditionally). A 'running' session
+    means every producer is still alive, i.e. someone may be genuinely
+    acquiring real data right now — leave that alone and just say so, the
+    same restraint app.py's own _alpide_bring_up applies before ever
+    touching a live session.
+    """
+    import alpide_daq
+    state = alpide_daq.session_state()
+    if state == 'none':
+        return
+    if state == 'stale':
+        print(f'\n[cleanup] ITS3 session left stale after the suite — clearing it')
+        alpide_daq.kill_session()
+        return
+    print(f'\n[cleanup] ITS3 session is still RUNNING after the suite — '
+          f'not touching it, this looks like a real acquisition in progress. '
+          f'Check it manually if that is unexpected.')
+
+
 if __name__ == '__main__':
     test_gate()
     test_kill_latch()
@@ -879,6 +907,7 @@ if __name__ == '__main__':
     test_session_json_provenance()
     test_beam_used_counter()
     test_arduino_reset()
+    _cleanup_stray_alpide_session()
     print()
     if FAILURES:
         print('%d failed: %s' % (len(FAILURES), ', '.join(FAILURES)))

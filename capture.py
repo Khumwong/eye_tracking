@@ -103,6 +103,24 @@ class CaptureThread:
 
         self._recording = False
         self._writer = None
+        # Records the composed display frame (detection circle, target
+        # crosshair, insets) alongside _writer's untouched camera frame — so
+        # what a session looked like on screen can be reviewed afterwards
+        # without a camera or Arduino attached, the same way _writer's raw
+        # footage lets detection.py be re-run and improved later.
+        #
+        # Off the detection loop, same reason _cut_writer is: a first version
+        # called cv2.VideoWriter.write() for this second file synchronously,
+        # right where the raw write already was, and cut achieved_fps from
+        # ~26 to ~16 in the next real session (session_20260821_164035 vs.
+        # 162409) — encoding a second 1080p frame every iteration was pure
+        # loop-budget cost the detection decision was paying for a feature
+        # that only helps someone review the file afterwards. A bounded
+        # queue + background thread moves the encode off that budget; a full
+        # queue drops the frame rather than stalling the loop, same trade
+        # _queue_cut already makes for cut snapshots.
+        self._rec_annotated_queue = None
+        self._rec_annotated_thread = None
         self._ts_file = None
         self._rec_frame_idx = 0
         self._writer_lock = threading.Lock()
@@ -169,6 +187,14 @@ class CaptureThread:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         with self._writer_lock:
             self._writer = cv2.VideoWriter(path, fourcc, self._fps, (w, h))
+            annotated_path = os.path.splitext(path)[0] + '_annotated.mp4'
+            self._rec_annotated_queue = queue.Queue(maxsize=config.CUT_QUEUE_MAX)
+            self._rec_annotated_thread = threading.Thread(
+                target=self._rec_annotated_writer,
+                args=(annotated_path, fourcc, self._fps, (w, h),
+                      self._rec_annotated_queue),
+                daemon=True)
+            self._rec_annotated_thread.start()
             # The writer is told the camera's nominal rate, but frames arrive at
             # whatever rate detection manages — 27 fps against a claimed 50 in
             # one measured run, so the file plays back at nearly twice real
@@ -182,6 +208,22 @@ class CaptureThread:
                 self._ts_file = None
             self._rec_frame_idx = 0
             self._recording = True
+
+    def _rec_annotated_writer(self, path, fourcc, fps, size, q):
+        """Encode the annotated video, off the detection loop — see the
+        _rec_annotated_queue comment in __init__ for why. `frame` objects
+        arrive by reference, same as _cut_writer's queue: _compose_display
+        builds a fresh array every iteration, so nothing downstream ever
+        mutates one after it's been queued."""
+        writer = cv2.VideoWriter(path, fourcc, fps, size)
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                writer.write(item)
+        finally:
+            writer.release()
 
     def start_track_log(self, folder):
         """Write output/session_<ts>/track.csv for the whole armed window: one
@@ -395,6 +437,12 @@ class CaptureThread:
             if self._writer:
                 self._writer.release()
                 self._writer = None
+            q, self._rec_annotated_queue = self._rec_annotated_queue, None
+            if q is not None:
+                q.put(None)               # sentinel: finish writing and release
+            t, self._rec_annotated_thread = self._rec_annotated_thread, None
+            if t is not None:
+                t.join(timeout=3.0)
             if self._ts_file:
                 try:
                     self._ts_file.close()
@@ -556,6 +604,11 @@ class CaptureThread:
                     with self._writer_lock:
                         if self._writer:
                             self._writer.write(raw)
+                            if self._rec_annotated_queue is not None:
+                                try:
+                                    self._rec_annotated_queue.put_nowait(frame)
+                                except queue.Full:
+                                    pass    # drop rather than stall the loop
                             if self._ts_file:
                                 try:
                                     self._ts_file.write(

@@ -99,6 +99,14 @@ ALPIDE_EVENTS    = 500000   # RunControl stops the run at this many events
 ALPIDE_STROBE    = 100
 ALPIDE_ITHR      = 60
 
+# Kcmh-Tricker's eudaq.stop() (the tmux-session teardown _alpide_stop() calls)
+# sleeps 1s + 5s before it issues the actual `tmux kill-session` — on_close()
+# joins that worker thread for up to this long so the process never exits
+# mid-sleep and leaves the ITS3 session (and its six producers) orphaned with
+# nothing left alive to finish killing it. A few seconds of margin over the
+# measured 6s worst case, not a tuned value.
+ALPIDE_STOP_JOIN_TIMEOUT_S = 9.0
+
 # Readout clock on D7 -> J1. 1 kHz gives 1 ms timing resolution, which is well
 # under the tens of ms of gating latency being measured, and sustains far longer
 # than 9500 Hz — where the six planes desync within about a second because the

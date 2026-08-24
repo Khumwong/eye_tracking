@@ -2484,6 +2484,15 @@ class EyeTrackingApp:
         analyze_latency.py only once the .raw is genuinely closed; every other
         caller (on_close, _daq_teardown) leaves it unset, since a launch that
         was cancelled or abandoned before START has nothing worth analysing.
+
+        Returns the worker Thread if one was started, else None — Kcmh-Tricker's
+        eudaq.stop() sleeps ~6s before it actually issues the tmux kill-session,
+        so a caller that is about to end the process (on_close) needs the handle
+        to join() on, or that kill-session never runs: the daemon thread gets cut
+        off mid-sleep the moment the process exits, leaving the ITS3 tmux session
+        (and its six producers) running with nothing left alive that remembers
+        it — exactly what was seen happening in practice before this returned
+        the thread instead of firing it and forgetting it.
         """
         pid, self._alpide_pid = self._alpide_pid, None
         self._close_ev_log()
@@ -2496,7 +2505,7 @@ class EyeTrackingApp:
         if self._session_root:
             self._save_its3_log(self._session_dir('debug'))
         if pid is None:
-            return
+            return None
         self._alpide_note('stopping acquisition…')
 
         def _work():
@@ -2505,7 +2514,9 @@ class EyeTrackingApp:
             if on_stopped is not None:
                 on_stopped()
 
-        threading.Thread(target=_work, daemon=True).start()
+        thread = threading.Thread(target=_work, daemon=True)
+        thread.start()
+        return thread
 
     def _auto_analyze(self, folder):
         """Run analyze_latency.py against the run that just finished, so the
@@ -2711,7 +2722,16 @@ class EyeTrackingApp:
             # exactly like one that finished normally.
             self._write_session_json(ended='app_closed')
             self.log(f'[SESSION] {self._session_root} — app closed while armed')
-        self._alpide_stop()
+        # Waited on, unlike every other _alpide_stop() call site: this is the
+        # last chance anything has to run before root.destroy() ends the
+        # process outright, and eudaq.stop()'s tmux kill-session comes after a
+        # ~6s sleep inside that worker thread — a daemon thread gets cut off
+        # wherever it happens to be the instant the process exits, so without
+        # this join the ITS3 tmux session (and its six producers) is left
+        # running with nothing left alive that remembers to kill it.
+        stop_thread = self._alpide_stop()
+        if stop_thread is not None:
+            stop_thread.join(timeout=config.ALPIDE_STOP_JOIN_TIMEOUT_S)
         self._teardown_capture()
         self._close_app_log()
         self.arduino.close()

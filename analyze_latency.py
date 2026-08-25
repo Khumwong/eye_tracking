@@ -267,13 +267,11 @@ def read_session(folder):
     with open(os.path.join(folder, 'session.json')) as f:
         meta = json.load(f)
     # A failed ALPIDE run looks exactly like a good one from the outside: the
-    # folder, the CSV and session.json are all written either way. This is the
-    # only thing that distinguishes them, and skipping the check has already
-    # cost one run.
-    if meta.get('alpide_error') is not None:
-        raise SystemExit('session has alpide_error=%r — the run recorded no '
-                         'detector data, there is nothing to analyse'
-                         % meta['alpide_error'])
+    # folder, the CSV and session.json are all written either way. meta's
+    # alpide_error is the only thing that distinguishes them, and skipping that
+    # check has already cost one run — main() raises on it, but only after the
+    # sections that describe this app rather than the detector have been
+    # printed, since those stay true when the .raw is missing entirely.
     if 'alpide_error' not in meta:
         print('warning: session.json predates the alpide_error field, so a '
               'failed ALPIDE run cannot be told apart from a good one here')
@@ -656,6 +654,219 @@ def report_budget_closing_leg(budget, rows):
     return budget
 
 
+# ── min beam-off: what the hold protects ─────────────────────────────────────
+# min_off_s does not exist to buy beam time, and reading it as a beam-time
+# trade gets its whole purpose backwards. It protects the gating hardware: with
+# no hold the relay follows the eye frame for frame, and the recorded sessions
+# replay to switching demands of up to 36 Hz. A hold is a limiter, so the way
+# to judge one is by the worst case it rules out — not by how often it happened
+# to change the outcome. A limiter that never had to act is still doing its job.
+#
+# track.csv holds everything needed to check it after the fact: the per-frame
+# trigger is the eye's own state, which does not depend on whether the beam
+# happened to be on, so the gate can be re-run over the recorded triggers at
+# other hold values. Nothing below is a new measurement; it is the run that
+# already happened, replayed against a parameter it did not use.
+#
+# What the table reports, and why:
+#   min OFF   the guarantee itself — the hold's whole job, and it should never
+#             come out below the value in force
+#   min ON    the leg nothing bounds. Closing is immediate by design, so the
+#             beam can be opened and shut again within one frame; that is a
+#             full switching cycle the hold cannot prevent. Watch this column,
+#             do not try to fix it with a minimum-on time — forcing the beam to
+#             stay lit after the eye has left is not an option available here.
+#   max Hz    fastest switching the relay was asked for anywhere in the run
+#   cycles    total switching events, the thing that accumulates as wear
+# Duty is reported last and deliberately: it is what the protection costs, not
+# what it is for.
+MIN_OFF_SWEEP_S = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
+
+
+def _replay_gate(t, trig, kill, hold, dwell=0.0):
+    """Re-run CaptureThread._gate_open over recorded frames at one hold value.
+
+    Mirrors that method exactly: the gate opens only on a live trigger that no
+    latch is blocking, and both opening conditions must be satisfied — the beam
+    has been down for `hold` since the cut, and the eye has been on target for
+    `dwell` since it arrived. Closing stays immediate, as it is in the gate.
+    Returns (frames the beam was open, [(time, opening?) per switch]).
+    """
+    state_open = False
+    off_since = None
+    on_since = None
+    frames_on = 0
+    switches = []
+    for i in range(len(t)):
+        live = trig[i] and not kill[i]
+        # The eye's own clock, reset by any frame that is not on target — the
+        # same one-frame-breaks-it rule the gate uses.
+        on_since = (on_since if on_since is not None else t[i]) if live else None
+        want = live
+        if want and not state_open:
+            if hold and off_since is not None and t[i] - off_since < hold:
+                want = False
+            if dwell and (on_since is None or t[i] - on_since < dwell):
+                want = False
+        if want != state_open:
+            switches.append((t[i], want))
+            state_open = want
+            if not want:
+                # _beam_off_since is stamped on the closing transition only,
+                # so a hold measures from the cut, not from the last bad frame.
+                off_since = t[i]
+        if state_open:
+            frames_on += 1
+    return frames_on, switches
+
+
+def _switch_stats(switches):
+    """Shortest ON and OFF the relay was asked to hold, and the fastest
+    switching rate anywhere in the run. None where a run never switched enough
+    to have the quantity at all."""
+    on = [switches[i + 1][0] - switches[i][0]
+          for i in range(len(switches) - 1) if switches[i][1]]
+    off = [switches[i + 1][0] - switches[i][0]
+           for i in range(len(switches) - 1) if not switches[i][1]]
+    gaps = [switches[i + 1][0] - switches[i][0] for i in range(len(switches) - 1)]
+    fastest = min((g for g in gaps if g > 0), default=None)
+    return (min(on) if on else None,
+            min(off) if off else None,
+            (1.0 / fastest) if fastest else None)
+
+
+def compute_min_off_sweep(folder, meta):
+    """What min_off_s cost this run and what it bought, across a range of
+    values, as a dict — no printing, same split as compute_budget().
+
+    None when the question cannot be answered honestly for this session:
+      - no track.csv (an older run), or too few rows to replay
+      - manual_resume was on, so reopening depended on operator clicks that
+        are not in the log and cannot be replayed at another hold value
+    """
+    path = os.path.join(folder, 'track.csv')
+    if not os.path.exists(path):
+        return None
+    if meta.get('manual_resume'):
+        return {'skipped': 'manual_resume was on — the opening leg depended on '
+                           'operator clicks that cannot be replayed'}
+    t, trig, kill = [], [], []
+    with open(path, newline='') as f:
+        for r in csv.DictReader(f):
+            try:
+                ts = float(r['t_capture'])
+            except (KeyError, ValueError):
+                continue
+            reason = r.get('reason', '')
+            if reason == 'unarmed':
+                continue          # outside the armed window; no beam to gate
+            if reason == 'latched':
+                return {'skipped': 'the manual-resume latch tripped during this '
+                                   'run, so the opening leg cannot be replayed'}
+            t.append(ts)
+            trig.append(r.get('detect') == '1')
+            kill.append(reason == 'kill')
+    if len(t) < 2:
+        return None
+    span = t[-1] - t[0]
+    if span <= 0:
+        return None
+
+    in_force = meta.get('min_off_s')
+    holds = sorted(set(MIN_OFF_SWEEP_S) |
+                   ({float(in_force)} if in_force is not None else set()))
+    # Swept against the dwell the run actually used, so the column compares
+    # hold values under this run's real gate rather than a gate it never had.
+    dwell = meta.get('min_on_target_s') or 0.0
+    rows = []
+    for h in holds:
+        frames_on, switches = _replay_gate(t, trig, kill, h, dwell)
+        min_on, min_off, max_hz = _switch_stats(switches)
+        rows.append({
+            'min_off_s':    round(h, 3),
+            'relay_cycles': len(switches),
+            'min_on_s':     None if min_on is None else round(min_on, 3),
+            'min_off_s_seen': None if min_off is None else round(min_off, 3),
+            'max_switch_hz': None if max_hz is None else round(max_hz, 1),
+            'short_on_pulses': sum(
+                1 for i in range(len(switches) - 1)
+                if switches[i][1] and switches[i + 1][0] - switches[i][0] < 0.3),
+            'duty_pct':     round(100.0 * frames_on / len(t), 1),
+            'beam_on_s':    round(span * frames_on / len(t), 2),
+            'in_force':     in_force is not None and abs(h - in_force) < 1e-9,
+        })
+
+    d = {'frames': len(t), 'span_s': round(span, 2),
+         'min_on_target_s': dwell, 'sweep': rows}
+    # What the dwell itself was worth on this run, held at the hold in force.
+    # Reported separately because the sweep above cannot show it: every row
+    # there already has it applied.
+    if in_force is not None and dwell:
+        no_dwell = _switch_stats(_replay_gate(t, trig, kill, in_force, 0.0)[1])
+        d['without_dwell'] = {
+            'min_on_s': None if no_dwell[0] is None else round(no_dwell[0], 3),
+            'max_switch_hz': None if no_dwell[2] is None else round(no_dwell[2], 1),
+        }
+    base = next((r for r in rows if r['min_off_s'] == 0.0), None)
+    cur = next((r for r in rows if r['in_force']), None)
+    if base and cur:
+        d['in_force_s'] = cur['min_off_s']
+        # The switching this hold ruled out, which is what it is for — and the
+        # duty it cost, which is what it is not for but still has to be paid.
+        d['max_switch_hz_unheld'] = base['max_switch_hz']
+        d['max_switch_hz_held'] = cur['max_switch_hz']
+        d['relay_cycles_saved'] = base['relay_cycles'] - cur['relay_cycles']
+        d['beam_given_up_s'] = round(base['beam_on_s'] - cur['beam_on_s'], 2)
+    return d
+
+
+def _fmt_s(v):
+    return '   —   ' if v is None else '%6.3fs' % v
+
+
+def report_min_off_sweep(sweep):
+    """Print what the hold guarantees the gating hardware, at the value in
+    force and at the alternatives. Call after report_budget(), which names
+    min_off_s in the opening leg but says nothing about what it protects."""
+    print()
+    print('── min beam-off: switching the hold rules out ' + '─' * 20)
+    if 'skipped' in sweep:
+        print('  not replayed: %s' % sweep['skipped'])
+        return
+    print('  %8s %7s %8s %8s %8s %7s %8s'
+          % ('min_off', 'cycles', 'min ON', 'min OFF', 'max Hz', 'duty', 'beam on'))
+    for r in sweep['sweep']:
+        print('  %s%6.2fs %7d %s %s %8s %6.1f%% %7.2fs%s'
+              % ('→' if r['in_force'] else ' ', r['min_off_s'], r['relay_cycles'],
+                 _fmt_s(r['min_on_s']), _fmt_s(r['min_off_s_seen']),
+                 '  —  ' if r['max_switch_hz'] is None else '%5.1f' % r['max_switch_hz'],
+                 r['duty_pct'], r['beam_on_s'],
+                 '  ← in force' if r['in_force'] else ''))
+    if 'in_force_s' not in sweep:
+        return
+    unheld = sweep['max_switch_hz_unheld']
+    held = sweep['max_switch_hz_held']
+    if unheld is not None and held is not None:
+        print('  at %.3g s the relay was never asked to switch faster than %.1f Hz; '
+              'with no hold it would have seen %.1f Hz'
+              % (sweep['in_force_s'], held, unheld))
+    print('  it cost %.2f s of beam to do that (%d fewer switching events)'
+          % (sweep['beam_given_up_s'], sweep['relay_cycles_saved']))
+    wd = sweep.get('without_dwell')
+    if wd and wd.get('max_switch_hz') is not None:
+        print('  every row above already has min_on_target_s = %.3g s applied; '
+              'without it this run peaks at %.1f Hz'
+              % (sweep['min_on_target_s'], wd['max_switch_hz']))
+    # The hold bounds the off leg only. A short ON is a full switching cycle it
+    # cannot reach, and the fix people reach for — a minimum on-time — would
+    # mean holding the beam lit after the eye left, so it is not available.
+    cur = next((r for r in sweep['sweep'] if r['in_force']), None)
+    if cur and cur['short_on_pulses']:
+        print('  %d ON pulse(s) under 0.3 s, shortest %s — the closing leg is '
+              'immediate by design, so no hold value bounds this; see next.md'
+              % (cur['short_on_pulses'], _fmt_s(cur['min_on_s']).strip()))
+
+
 def health_summary(run, meta, events, skipped, n_trig, hz):
     """The same facts report_health() prints, as a dict — kept as a separate
     read of the same inputs rather than parsed out of the printed text, so a
@@ -751,10 +962,40 @@ def _run(args, analysis):
                         ('trigger_hz', 'trigger_duty', 'threshold_mm',
                          'min_off_s', 'started', 'stopped', 'ended',
                          'beam_on_s')}
+
+    # Everything below the detector gates describes the .raw and must not run
+    # without one. These two do not: they are measured from track.csv on this
+    # app's own clock, and a run that never reached the detector is exactly the
+    # run where they are the only thing left to learn. Computed here, printed
+    # in report order on the full path and ahead of every bail otherwise.
+    budget = compute_budget(folder)
+    sweep = compute_min_off_sweep(folder, meta)
+    app_side_done = False
+
+    def report_app_side():
+        nonlocal app_side_done
+        if app_side_done:
+            return
+        app_side_done = True
+        if budget:
+            report_budget(budget, meta)
+            analysis['latency_budget'] = budget
+        if sweep:
+            report_min_off_sweep(sweep)
+            analysis['min_off_sweep'] = sweep
+
+    if meta.get('alpide_error') is not None:
+        report_app_side()
+        analysis['verdict'] = 'alpide_error'
+        raise SystemExit('session has alpide_error=%r — the run recorded no '
+                         'detector data, so nothing below the app-side '
+                         'sections above can be analysed'
+                         % meta['alpide_error'])
     events, skipped = read_beam_events(folder)
 
     raws = sorted(glob.glob(os.path.join(folder, 'alpide', '*.raw')))
     if not raws:
+        report_app_side()
         analysis['verdict'] = 'no_raw_file'
         raise SystemExit('no .raw file in %s — the run produced no detector '
                          'data at all, which the rest of the session folder '
@@ -763,6 +1004,7 @@ def _run(args, analysis):
         print('warning: %d raw files, using %s' % (len(raws), os.path.basename(raws[-1])))
     run = read_raw(raws[-1], progress=not args.quiet)
     if run.hits is None:
+        report_app_side()
         analysis['verdict'] = 'no_decodable_data'
         raise SystemExit('no decodable ALPIDE data in %s' % raws[-1])
 
@@ -772,14 +1014,10 @@ def _run(args, analysis):
 
     report_health(run, meta, events, skipped, n_trig)
     analysis['health'] = health_summary(run, meta, events, skipped, n_trig, hz)
-    # Independent of whether this run has any beam signal at all: it is a
-    # measurement of this app's own performance, not of the .raw. Computed
-    # once here; report_budget_closing_leg augments the same dict later if
-    # `rows` ends up existing, rather than this being read or printed twice.
-    budget = compute_budget(folder)
-    if budget:
-        report_budget(budget, meta)
-        analysis['latency_budget'] = budget
+    # In report order on the full path — the same two sections every bail above
+    # already printed for itself. report_budget_closing_leg augments the same
+    # budget dict later if `rows` ends up existing, so it is never re-read.
+    report_app_side()
 
     if args.self_check:
         analysis['verdict'] = 'self_check'

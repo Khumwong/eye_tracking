@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import config
@@ -114,9 +115,32 @@ def _programmer():
             or os.path.expanduser('~/.local/bin/alpide-daq-program'))
 
 
-def install_firmware(on_line=None, on_done=None):
+# Kcmh-Tricker's own value for this same tool — its UI carries a hard timeout
+# for exactly the reason this one now does too, see install_firmware's
+# docstring. Not a guess: it is the number their own use of alpide-daq-program
+# has already been tuned against.
+FIRMWARE_TIMEOUT_S = 180
+
+
+def install_firmware(on_line=None, on_done=None, timeout_s=FIRMWARE_TIMEOUT_S):
     """Flash all boards, streaming output to on_line(str). Blocking — call from
-    a worker thread and marshal the callbacks back to the UI."""
+    a worker thread and marshal the callbacks back to the UI.
+
+    Bounded at timeout_s because alpide-daq-program has no timeout of its own:
+    if a board fails to re-enumerate after being flashed, it blocks waiting
+    for that indefinitely. Kcmh-Tricker's own UI documents hitting exactly
+    this ("ค้างใน select() รอ udev event ตลอดกาล" — its FirmwareToast dialog
+    exists specifically to bound and cancel it) and guards it with the same
+    terminate() → wait(3s) → kill() sequence used here. Without this, the
+    call — and the caller's busy flag, since on_done never fires until this
+    returns — is stuck for as long as the process lives: in practice, on
+    2026-08-25, that was 3.5 hours until someone found and killed it by hand.
+
+    The watchdog runs on its own thread rather than wrapping proc.wait() in a
+    timeout directly, because the line-reading loop below is itself a
+    blocking read that a wait()-only timeout would not interrupt — killing
+    the process is what unblocks it, by closing the pipe out from under it.
+    """
     fx3, fpga, missing = firmware_files()
     if missing:
         if on_line:
@@ -135,12 +159,33 @@ def install_firmware(on_line=None, on_done=None):
         if on_done:
             on_done(False)
         return False
+
+    timed_out = threading.Event()
+
+    def _watchdog():
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out.set()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    watchdog = threading.Thread(target=_watchdog, daemon=True)
+    watchdog.start()
+
     for line in proc.stdout:
         line = line.rstrip()
         if on_line and line:
             on_line(line.split('\r')[-1])
     proc.wait()
-    ok = proc.returncode == 0
+    watchdog.join()
+    if timed_out.is_set() and on_line:
+        on_line(f'timed out after {timeout_s}s waiting for a board to '
+                're-enumerate — killed')
+    ok = proc.returncode == 0 and not timed_out.is_set()
     if on_done:
         on_done(ok)
     return ok

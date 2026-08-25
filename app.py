@@ -94,6 +94,7 @@ class EyeTrackingApp:
         self.detect_method  = tk.StringVar(value='facemesh')
         self.threshold_mm   = tk.DoubleVar(value=config.DEFAULT_THRESHOLD_MM)
         self.min_off_s      = tk.DoubleVar(value=config.DEFAULT_MIN_OFF_S)
+        self.min_on_target_s = tk.DoubleVar(value=config.DEFAULT_MIN_ON_TARGET_S)
         self.manual_resume  = tk.BooleanVar(value=False)
         self.gray_crosscheck = tk.BooleanVar(value=config.GRAY_CROSSCHECK_ENABLED)
         self.preview_fps    = tk.IntVar(value=config.PREVIEW_FPS)
@@ -137,6 +138,7 @@ class EyeTrackingApp:
             'side': 'left', 'speed': 1.0, 'loop': True,
             'detect_method': 'facemesh', 'threshold_mm': config.DEFAULT_THRESHOLD_MM,
             'min_off_s': config.DEFAULT_MIN_OFF_S,
+            'min_on_target_s': config.DEFAULT_MIN_ON_TARGET_S,
             'manual_resume': False,
             'capture_downscale': config.CAPTURE_DOWNSCALE,
             'gray_crosscheck': config.GRAY_CROSSCHECK_ENABLED,
@@ -161,6 +163,7 @@ class EyeTrackingApp:
         self.detect_method.trace_add( 'write', lambda *_: s('detect_method', self.detect_method))
         self.threshold_mm.trace_add(  'write', lambda *_: s('threshold_mm',  self.threshold_mm))
         self.min_off_s.trace_add(     'write', lambda *_: self._sync_min_off())
+        self.min_on_target_s.trace_add('write', lambda *_: self._sync_min_on_target())
         self.preview_fps.trace_add(   'write', lambda *_: self._sync_preview_fps())
         self.playback_speed.trace_add('write', lambda *_: s('speed',         self.playback_speed))
         self.video_loop.trace_add(    'write', lambda *_: s('loop',    self.video_loop))
@@ -602,6 +605,23 @@ class EyeTrackingApp:
                                        relief='flat', justify='right',
                                        font=('Courier', 9))
         self._minoff_entry.pack(side=tk.RIGHT)
+
+        # The same protection on the way back in. Kept as its own box rather
+        # than folded into the one above because they answer different
+        # questions — how long the beam rests after a cut, versus how steady
+        # the eye has to be before it is trusted again — and a run may well
+        # want one without the other.
+        drow = tk.Frame(inner, bg=PANEL)
+        drow.pack(fill=tk.X, padx=12, pady=(0, 8))
+        tk.Label(drow, text="Min on-target", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9)).pack(side=tk.LEFT)
+        tk.Label(drow, text="s", bg=PANEL, fg=MUTEDT,
+                 font=('Helvetica', 8)).pack(side=tk.RIGHT, padx=(4, 0))
+        self._dwell_entry = tk.Entry(drow, textvariable=self.min_on_target_s,
+                                     width=6, bg=INSET, fg=TEXT,
+                                     insertbackground=TEXT, relief='flat',
+                                     justify='right', font=('Courier', 9))
+        self._dwell_entry.pack(side=tk.RIGHT)
 
         # Off by default: existing auto-reopen (with or without the Min
         # beam-off hold above) keeps working unchanged. When on, an
@@ -1428,6 +1448,7 @@ class EyeTrackingApp:
         self._fp_tab.config(state=state)
         self._threshold_scale.config(state=state)
         self._minoff_entry.config(state=state)
+        self._dwell_entry.config(state=state)
         self._resume_chk.config(state=state)
         self._gray_chk.config(state=state)
         self._preview_fps_entry.config(state=state)
@@ -1451,7 +1472,8 @@ class EyeTrackingApp:
                 "KILL BEAM ค้างอยู่ — กดปล่อยก่อนเริ่ม tracking")
             return
         self._set_config_locked(True)
-        self._min_off_value()      # normalise the typed box against what is in force
+        self._min_off_value()      # normalise the typed boxes against what is
+        self._min_on_target_value()  # actually in force
         self._beam_on_total = 0.0  # beam delivered is counted per run, not per app
         self._beam_on_since = None
         # a fresh folder per run, unless LAUNCH/RECORD/debug already opened one
@@ -1647,6 +1669,15 @@ class EyeTrackingApp:
             return
         self._p['min_off_s'] = max(0.0, min(self._MIN_OFF_MAX_S, v))
 
+    def _sync_min_on_target(self):
+        """Same contract as _sync_min_off for the on-target dwell: per
+        keystroke, and a half-typed box leaves the last good value in force."""
+        try:
+            v = float(self.min_on_target_s.get())
+        except (tk.TclError, ValueError):
+            return
+        self._p['min_on_target_s'] = max(0.0, min(self._MIN_OFF_MAX_S, v))
+
     def _sync_manual_resume(self):
         """Checkbutton callback: push the choice into the params the capture
         thread reads. A discrete per-click callback, unlike min_off_s's
@@ -1685,6 +1716,18 @@ class EyeTrackingApp:
         v = max(0.0, min(self._MIN_OFF_MAX_S, v))
         self.min_off_s.set(v)
         self._p['min_off_s'] = v
+        return v
+
+    def _min_on_target_value(self):
+        """The dwell counterpart of _min_off_value, normalised at START for
+        the same reason: the box must agree with what is in force."""
+        try:
+            v = float(self.min_on_target_s.get())
+        except (tk.TclError, ValueError):
+            v = config.DEFAULT_MIN_ON_TARGET_S
+        v = max(0.0, min(self._MIN_OFF_MAX_S, v))
+        self.min_on_target_s.set(v)
+        self._p['min_on_target_s'] = v
         return v
 
     def _trigger_hz_value(self):
@@ -1834,6 +1877,8 @@ class EyeTrackingApp:
             'detect_method':  self.detect_method.get(),
             'threshold_mm':   self.threshold_mm.get(),
             'min_off_s':      self._p.get('min_off_s', config.DEFAULT_MIN_OFF_S),
+            'min_on_target_s': self._p.get('min_on_target_s',
+                                           config.DEFAULT_MIN_ON_TARGET_S),
             'manual_resume':  self._p.get('manual_resume', False),
             'target_x':       self.center_x.get(),
             'target_y':       self.center_y.get(),
@@ -2416,8 +2461,18 @@ class EyeTrackingApp:
         was launched and then abandoned: _alpide_pid stayed set, and the first
         thing _launch_daq() does is return when it is — so the next LAUNCH did
         nothing at all while its button sat there lit as the step to press.
+
+        Calls _alpide_stop(sync=True), for the same reason on_close() does
+        (see its docstring): this call site cannot assume the process stays up
+        long enough for a background thread to finish on its own — ENABLE
+        coming down or CANCEL DAQ is exactly the kind of moment an operator
+        closes the app right after, and a live run on 2026-08-25 did precisely
+        that, leaving six orphaned producers for the next LAUNCH to collide
+        with. Blocks the caller (all three are UI-thread callbacks) for ~6s
+        only when there is a run to tear down — the common case, nothing
+        launched, returns immediately and this is a no-op.
         """
-        self._alpide_stop()             # saves eudaq.log while _session_root lives
+        self._alpide_stop(sync=True)    # saves eudaq.log while _session_root lives
         self._session_root = ''         # the next run gets its own folder
         self._close_app_log()           # the next one gets a fresh app.log
         self._pending_start_hz = None
@@ -2477,22 +2532,41 @@ class EyeTrackingApp:
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _alpide_stop(self, on_stopped=None):
-        """Stop EUDAQ2. `on_stopped`, if given, runs on the worker thread once
-        stop_run() actually returns — not when this method does, which fires
-        the tmux kill and moves on without waiting. stop() uses it to start
-        analyze_latency.py only once the .raw is genuinely closed; every other
-        caller (on_close, _daq_teardown) leaves it unset, since a launch that
-        was cancelled or abandoned before START has nothing worth analysing.
+    def _alpide_stop(self, on_stopped=None, sync=False):
+        """Stop EUDAQ2.
 
-        Returns the worker Thread if one was started, else None — Kcmh-Tricker's
-        eudaq.stop() sleeps ~6s before it actually issues the tmux kill-session,
-        so a caller that is about to end the process (on_close) needs the handle
-        to join() on, or that kill-session never runs: the daemon thread gets cut
-        off mid-sleep the moment the process exits, leaving the ITS3 tmux session
-        (and its six producers) running with nothing left alive that remembers
-        it — exactly what was seen happening in practice before this returned
-        the thread instead of firing it and forgetting it.
+        Two modes, chosen by how certain the caller needs to be that the ITS3
+        tmux session is actually gone by the time this returns:
+
+        sync=False (default) fires a daemon thread and returns immediately —
+        `on_stopped`, if given, runs on that thread once stop_run() actually
+        returns, not when this method does. stop() uses this for the ordinary
+        end of a run: STOP is pressed often, and Kcmh-Tricker's eudaq.stop()
+        sleeps ~6s before it issues the tmux kill-session, so blocking the UI
+        for that on every STOP would be a real cost paid on the common path.
+        Nothing here is on the beam-safety path either way — CaptureThread
+        gates the beam on its own thread regardless of what this one is doing.
+
+        sync=True calls stop_run() directly on the caller's own thread and
+        only returns once the kill-session command has actually been issued —
+        the same guarantee Kcmh-Tricker's own UI gets, by the same mechanism:
+        Tk (like Qt) is single-threaded, so nothing else this app does,
+        including root.destroy(), can run while this call is still blocking
+        it. on_close() and _daq_teardown() use this: both are the rare,
+        deliberate kind of action (closing the app, ENABLE coming down,
+        CANCEL DAQ) rather than the frequent one, so trading a guaranteed
+        ~6s pause for a guarantee that holds regardless of what happens the
+        instant afterwards is the right side of that trade — a background
+        thread here has nothing to protect against a process that might exit
+        before it finishes. A live session on 2026-08-25 was exactly that:
+        ENABLE came down, the old fire-and-forget call started the ~6s
+        sequence, and the app process ended inside that window, cutting the
+        daemon thread off before tmux kill-session ever ran and leaving six
+        producers orphaned for the next LAUNCH to collide with.
+
+        Returns the worker Thread when sync=False and one was started, else
+        None — including the sync=True path, where by the time this returns
+        there is nothing left to wait on.
         """
         pid, self._alpide_pid = self._alpide_pid, None
         self._close_ev_log()
@@ -2514,6 +2588,9 @@ class EyeTrackingApp:
             if on_stopped is not None:
                 on_stopped()
 
+        if sync:
+            _work()
+            return None
         thread = threading.Thread(target=_work, daemon=True)
         thread.start()
         return thread
@@ -2581,6 +2658,40 @@ class EyeTrackingApp:
             self._alpide_note('analysis failed to run: %s: %s'
                               % (type(e).__name__, e))
             self.log_to_folder(folder, '[ANALYZE] failed to run: %s: %s'
+                               % (type(e).__name__, e))
+
+        self._auto_plot(folder)
+
+    def _auto_plot(self, folder):
+        """Run plot_beam_overlap.py against the run that just finished, so
+        plot_overlap.png exists next to report.txt without anyone remembering
+        to ask for it.
+
+        Separate try/except from the analyze_latency.py call above rather than
+        folded into it: this can fail on its own (too few beam_events rows to
+        fit the trigger<->clock bridge, no beam signal at all) on a run where
+        the text analysis above succeeded fine, and the two are unrelated
+        outcomes that should not be read as one — a run with nothing to plot
+        is not a run analyze_latency.py failed on.
+        """
+        script = os.path.join(os.path.dirname(__file__), 'plot_beam_overlap.py')
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, folder],
+                capture_output=True, text=True, timeout=60)
+            if proc.returncode == 0:
+                self.log_to_folder(folder, '[PLOT] %s'
+                                   % (proc.stdout.strip().splitlines()[0]
+                                      if proc.stdout.strip() else 'wrote plot_overlap.png'))
+            else:
+                # Expected on almost every run without real beam signal, or
+                # with too few B0/B1 transitions to fit the clock bridge —
+                # plot_beam_overlap.py says which on stderr and exits cleanly,
+                # so this is a note for the log, not an operator-facing warning.
+                msg = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else '(no message)'
+                self.log_to_folder(folder, '[PLOT] skipped: %s' % msg)
+        except Exception as e:
+            self.log_to_folder(folder, '[PLOT] failed to run: %s: %s'
                                % (type(e).__name__, e))
 
     @staticmethod
@@ -2722,16 +2833,12 @@ class EyeTrackingApp:
             # exactly like one that finished normally.
             self._write_session_json(ended='app_closed')
             self.log(f'[SESSION] {self._session_root} — app closed while armed')
-        # Waited on, unlike every other _alpide_stop() call site: this is the
-        # last chance anything has to run before root.destroy() ends the
-        # process outright, and eudaq.stop()'s tmux kill-session comes after a
-        # ~6s sleep inside that worker thread — a daemon thread gets cut off
-        # wherever it happens to be the instant the process exits, so without
-        # this join the ITS3 tmux session (and its six producers) is left
-        # running with nothing left alive that remembers to kill it.
-        stop_thread = self._alpide_stop()
-        if stop_thread is not None:
-            stop_thread.join(timeout=config.ALPIDE_STOP_JOIN_TIMEOUT_S)
+        # sync=True here for the same reason _daq_teardown() uses it too (see
+        # _alpide_stop's docstring): this is the last chance anything has to
+        # run before root.destroy() ends the process outright, and a
+        # fire-and-forget thread has no way to finish eudaq.stop()'s ~6s
+        # sequence once that happens.
+        self._alpide_stop(sync=True)
         self._teardown_capture()
         self._close_app_log()
         self.arduino.close()

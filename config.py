@@ -39,12 +39,20 @@ CAPTURE_DOWNSCALE = 1.0
 # comparison readout only — never touches trigger/threshold/Arduino, see
 # CaptureThread._detect_gray_iris) is one of two full FaceMesh instances
 # running during preview. Set False to skip creating it entirely — not just
-# throttle how often it runs — as a temporary way to shed that instance's
-# CPU/thread cost while a real independent second camera (see next.md,
-# "กล้องตัวที่สอง") isn't built yet. The comparison readout on screen shows
-# nothing while this is off; the primary detection path is untouched either
-# way.
-GRAY_CROSSCHECK_ENABLED = True
+# throttle how often it runs — as a way to shed that instance's CPU/thread
+# cost while a real independent second camera (see next.md, "กล้องตัวที่สอง")
+# isn't built yet. The comparison readout on screen shows nothing while this
+# is off; the primary detection path is untouched either way.
+#
+# Off by default since 2026-08-25: it was never real redundancy (same camera,
+# same frame, just grayscale) and nothing reads its output to decide anything
+# about the beam, so its only job was a comparison readout on screen that
+# nobody was using — while its cost was a second FaceMesh instance's thread
+# pool running the whole time preview is open. That matched a reported
+# symptom directly: mouse/keyboard lag right after launch, when preview
+# auto-opens (see README, "ประสิทธิภาพ CPU" — measured 200-345% CPU with this
+# on). Switch it on from the UI when the comparison itself is what's wanted.
+GRAY_CROSSCHECK_ENABLED = False
 
 # Preview (armed=False) has no latency to protect — nothing feeds
 # t_decided - t_capture or any beam decision while unarmed, since `armed`
@@ -73,10 +81,38 @@ PREVIEW_FPS = 8
 # MU regardless, so a low duty cycle is paid for in how long the patient is held
 # in position — which is why the hold is not simply set as long as possible.
 #
-# 1.0 s absorbs every sub-second off-period seen so far while keeping the duty
-# cycle usable. Set 0 to disable. The value that should actually be used is a
-# clinical judgement, not this default — see next.md.
+# What this protects is the gating hardware, not the beam budget: without a
+# hold the relay follows the eye frame for frame, and replaying the sessions on
+# record through _gate_open shows it would have been commanded to switch at up
+# to 43 Hz. That is the failure mode the hold exists to stop, so the number to
+# judge it by is the switching it prevents, not the beam-on seconds it costs.
+#
+# This bounds the OFF leg: once cut, the beam stays down at least this long.
+# Set 0 to disable. It says nothing about how long the beam then stays up —
+# that is DEFAULT_MIN_ON_TARGET_S below, and the two are needed together.
 DEFAULT_MIN_OFF_S = 1.0
+
+# The other half of the same protection, on the way back in: the eye must have
+# been continuously on target for this long before the beam may reopen.
+#
+# Without it the hold counts from the cut alone, so an eye that comes back at
+# 0.9 s reopens the beam at 1.0 s having been steady for 0.1 s — and if it
+# leaves again on the next frame the relay has just been switched twice in
+# ~130 ms. Requiring the eye to hold still first means the beam only opens on
+# evidence that it will stay open, which is what actually stops the chatter:
+# replayed over the sessions on record it takes peak switching from 43.6 Hz
+# down to 14.3 Hz, and raises beam time at the same time, because it buys the
+# reduction by opening at better moments rather than by opening less often.
+#
+# Safe in the same one direction as the hold: it can only ever delay an
+# opening. No value of it can keep an already-open beam from closing.
+#
+# 1.0 s, not longer: on-target stretches in the sessions on record run to a
+# median of 1.46 s, so a 3 s requirement would have suppressed nearly every
+# opening. Those runs are the development team deliberately sweeping their
+# eyes around, not a patient fixating on a target, so treat that number as a
+# floor on how demanding this may be, not as a tuned value. Set 0 to disable.
+DEFAULT_MIN_ON_TARGET_S = 1.0
 
 # ── Target overlay ───────────────────────────────────
 TARGET_MARK_PX   = 8   # half-length of the fixed crosshair at the target point
@@ -98,14 +134,6 @@ ALPIDE_NUM       = 6
 ALPIDE_EVENTS    = 500000   # RunControl stops the run at this many events
 ALPIDE_STROBE    = 100
 ALPIDE_ITHR      = 60
-
-# Kcmh-Tricker's eudaq.stop() (the tmux-session teardown _alpide_stop() calls)
-# sleeps 1s + 5s before it issues the actual `tmux kill-session` — on_close()
-# joins that worker thread for up to this long so the process never exits
-# mid-sleep and leaves the ITS3 session (and its six producers) orphaned with
-# nothing left alive to finish killing it. A few seconds of margin over the
-# measured 6s worst case, not a tuned value.
-ALPIDE_STOP_JOIN_TIMEOUT_S = 9.0
 
 # Readout clock on D7 -> J1. 1 kHz gives 1 ms timing resolution, which is well
 # under the tens of ms of gating latency being measured, and sustains far longer

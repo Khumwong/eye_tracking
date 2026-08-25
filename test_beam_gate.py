@@ -90,7 +90,7 @@ def make_capture(armed=True, **params):
 
 def test_gate():
     print('\n-- what opens the beam --')
-    c = make_capture(armed=True)
+    c = make_capture(armed=True, min_on_target_s=0)
 
     check('on target while armed opens it', c._gate_open(True) is True)
     check('off target keeps it shut', c._gate_open(False) is False)
@@ -103,7 +103,7 @@ def test_gate():
 
 def test_kill_latch():
     print('\n-- the kill latch outranks the eye --')
-    c = make_capture(armed=True)
+    c = make_capture(armed=True, min_on_target_s=0)
     check('starts unlatched', c.kill_latched is False)
 
     c.kill_latched = True
@@ -124,7 +124,7 @@ def test_kill_latch():
 
 def test_min_off_hold():
     print('\n-- the beam stays off for a minimum time once cut --')
-    c = make_capture(armed=True, min_off_s=2.0)
+    c = make_capture(armed=True, min_off_s=2.0, min_on_target_s=0)
     t0 = 1000.0
 
     check('no hold before the first cut of a run',
@@ -155,7 +155,7 @@ def test_min_off_hold():
 
 def test_auto_latch():
     print('\n-- the manual-resume latch outranks the eye, like the kill latch --')
-    c = make_capture(armed=True)
+    c = make_capture(armed=True, min_on_target_s=0)
     check('starts unlatched', c.auto_latched is False)
 
     c.auto_latched = True
@@ -219,14 +219,14 @@ def test_resume_request():
 
 def test_min_off_disabled():
     print('\n-- setting it to zero restores the old behaviour --')
-    c = make_capture(armed=True, min_off_s=0.0)
+    c = make_capture(armed=True, min_off_s=0.0, min_on_target_s=0)
     c._beam_off_since = 1000.0
     check('reopens immediately with the hold off',
           c._gate_open(True, now=1000.001) is True)
 
     # and the default is what config says, not a hidden literal
     import config
-    d = make_capture(armed=True)
+    d = make_capture(armed=True, min_on_target_s=0)
     d._beam_off_since = 1000.0
     inside = d._gate_open(True, now=1000.0 + config.DEFAULT_MIN_OFF_S - 0.01)
     outside = d._gate_open(True, now=1000.0 + config.DEFAULT_MIN_OFF_S + 0.01)
@@ -234,6 +234,146 @@ def test_min_off_disabled():
           (inside is False and outside is True)
           if config.DEFAULT_MIN_OFF_S > 0 else outside is True,
           'default %.1f s' % config.DEFAULT_MIN_OFF_S)
+
+
+def test_min_on_target_dwell():
+    print('\n-- the eye must hold still before the beam comes back --')
+    c = make_capture(armed=True, min_off_s=0, min_on_target_s=1.0)
+    t0 = 1000.0
+
+    check('the first on-target frame does not open it',
+          c._gate_open(True, now=t0) is False)
+    check('still refused at 0.9 s of holding still',
+          c._gate_open(True, now=t0 + 0.9) is False)
+    check('opens once the eye has held still long enough',
+          c._gate_open(True, now=t0 + 1.0) is True)
+
+    # The whole point: a stretch that breaks starts over. Without this the
+    # dwell would be satisfiable by an eye that was on target a while ago.
+    check('losing the eye closes it immediately',
+          c._gate_open(False, now=t0 + 1.1) is False)
+    check('coming back does not inherit the old stretch',
+          c._gate_open(True, now=t0 + 1.2) is False)
+    check('the new stretch has to earn it from scratch',
+          c._gate_open(True, now=t0 + 2.2) is True)
+
+    # One bad frame in the middle is enough to restart it — the clock measures
+    # an unbroken stretch, not a majority of recent frames.
+    c._gate_open(False, now=t0 + 3.0)
+    check('a single dropped frame restarts the dwell',
+          c._gate_open(True, now=t0 + 3.9) is False)
+
+    # ...and it can only ever delay an opening, like every other guard here.
+    c2 = make_capture(armed=True, min_off_s=0, min_on_target_s=1.0)
+    c2._gate_open(True, now=t0)
+    check('a satisfied dwell still cannot outrank the eye',
+          c2._gate_open(False, now=t0 + 5.0) is False)
+    c2.kill_latched = True
+    check('a satisfied dwell still cannot outrank a kill',
+          c2._gate_open(True, now=t0 + 6.0) is False)
+
+
+def test_dwell_and_hold_together():
+    print('\n-- the hold and the dwell are both required, not either --')
+    c = make_capture(armed=True, min_off_s=1.0, min_on_target_s=1.0)
+    t0 = 1000.0
+    c._beam_off_since = t0                       # the beam was just cut
+
+    # The eye comes back at 0.1 s and holds still from there. Whichever of the
+    # two finishes last governs: the hold is up at 1.0 s, but the eye's own
+    # stretch only reaches 1.0 s at 1.1 s, so that is when the beam may open.
+    check('eye back at 0.1 s, both clocks running: shut',
+          c._gate_open(True, now=t0 + 0.1) is False)
+    check('...still shut at 0.9 s', c._gate_open(True, now=t0 + 0.9) is False)
+    check('the expired hold alone does not open it at 1.0 s',
+          c._gate_open(True, now=t0 + 1.0) is False)
+    check('open at 1.1 s, when the later of the two is satisfied',
+          c._gate_open(True, now=t0 + 1.1) is True)
+
+    # The other order: the hold expires first, but the eye only just arrived.
+    # This is the case the hold alone cannot see, and the reason for the pair.
+    d = make_capture(armed=True, min_off_s=1.0, min_on_target_s=1.0)
+    d._beam_off_since = t0
+    d._gate_open(False, now=t0 + 0.5)            # eye still away
+    check('hold expired but the eye just got back: shut',
+          d._gate_open(True, now=t0 + 1.1) is False)
+    check('...and it waits out the full dwell from arrival',
+          d._gate_open(True, now=t0 + 2.0) is False)
+    check('open only once the eye has held still since arriving',
+          d._gate_open(True, now=t0 + 2.1) is True)
+
+
+def test_dwell_reason_is_reported():
+    print('\n-- track.csv says which of the two is holding it shut --')
+    c = make_capture(armed=True, min_off_s=1.0, min_on_target_s=1.0)
+    t0 = 1000.0
+    # The reason must describe the decision _gate_open just made, so drive it
+    # through _gate_open rather than posing the state by hand — that is the
+    # only way the two can be shown to agree.
+    c._beam_off_since = t0
+    c._gate_open(True, now=t0 + 0.1)             # eye just back, dwell running
+    check("eye not yet steady reads 'dwell'",
+          c._gate_reason(True, False) == 'dwell')
+
+    c._gate_open(True, now=t0 + 1.1)             # dwell satisfied...
+    c._beam_off_since = t0 + 1.0                 # ...but the beam was recut
+    c._gate_open(True, now=t0 + 1.5)
+    check("beam still cooling down reads 'hold'",
+          c._gate_reason(True, False) == 'hold')
+
+    check('an open gate still has no reason at all',
+          c._gate_reason(True, True) == '')
+    c.kill_latched = True
+    check('a kill still outranks both in the reason too',
+          c._gate_reason(True, False) == 'kill')
+
+
+def test_min_on_target_disabled():
+    print('\n-- setting the dwell to zero restores the old behaviour --')
+    c = make_capture(armed=True, min_off_s=0, min_on_target_s=0)
+    check('the first on-target frame opens it again',
+          c._gate_open(True, now=1000.0) is True)
+
+    import config
+    d = make_capture(armed=True, min_off_s=0)
+    first = d._gate_open(True, now=1000.0)
+    later = d._gate_open(True, now=1000.0 + config.DEFAULT_MIN_ON_TARGET_S + 0.01)
+    check('unset params fall back to config.DEFAULT_MIN_ON_TARGET_S',
+          (first is False and later is True)
+          if config.DEFAULT_MIN_ON_TARGET_S > 0 else first is True,
+          'default %.1f s' % config.DEFAULT_MIN_ON_TARGET_S)
+
+
+def test_no_face_is_not_a_blink():
+    print('\n-- a lost face and a shut eye are logged apart --')
+    # Both close the beam, and must: the difference is never a safety one. It
+    # is a diagnostic one, and it went missing for real — session_20260824_180704
+    # spent its last 343 frames logged as 'blink' with the eyes wide open,
+    # because the detection loop flattened None to False before anything could
+    # tell them apart. That took a video review to work out.
+    c = make_capture(armed=True, min_off_s=0, min_on_target_s=0)
+
+    c._last_deviation_mm = None
+    check("no face at all reads 'no_face'",
+          c._gate_reason(None, c._gate_open(None)) == 'no_face')
+
+    c._last_deviation_mm = None                  # face found, no reading taken
+    check("face found but the eye is shut reads 'blink'",
+          c._gate_reason(False, c._gate_open(False)) == 'blink')
+
+    c._last_deviation_mm = 7.2                   # face found, eye measured
+    check("face found but off target reads 'deviation'",
+          c._gate_reason(False, c._gate_open(False)) == 'deviation')
+
+    c._last_deviation_mm = 2.1
+    check('and on target still opens it, reason blank',
+          c._gate_open(True) is True
+          and c._gate_reason(True, True) == '')
+
+    # The whole point of keeping them apart is that it changes nothing here.
+    for result in (None, False):
+        check('%r still keeps the beam shut' % (result,),
+              c._gate_open(result) is False)
 
 
 def test_chatter_is_absorbed():
@@ -317,9 +457,9 @@ def test_stop_order():
     app.input_mode.set('camera')
     orig_alpide_stop = app._alpide_stop
 
-    def _traced_alpide_stop(on_stopped=None):
+    def _traced_alpide_stop(on_stopped=None, sync=False):
         log.append(('_alpide_stop', ''))
-        orig_alpide_stop(on_stopped=on_stopped)
+        orig_alpide_stop(on_stopped=on_stopped, sync=sync)
     app._alpide_stop = _traced_alpide_stop
 
     app.stop()
@@ -410,7 +550,7 @@ def _idle_app(root):
 
 
 def _trace_alpide_stop(app, calls):
-    def _traced():
+    def _traced(on_stopped=None, sync=False):
         calls.append(True)
         app._alpide_pid = None      # what the real teardown ends up doing
     app._alpide_stop = _traced
@@ -577,7 +717,7 @@ def test_auto_record():
 
     stopped = []
     app._stop_rec = lambda: stopped.append(True)
-    app._alpide_stop = lambda: None
+    app._alpide_stop = lambda on_stopped=None, sync=False: None
     app._alpide_pid = 4242
     app._cancel_daq()
     check('CANCEL stops a recording it is responsible for', stopped == [True])
@@ -893,6 +1033,11 @@ if __name__ == '__main__':
     test_closed_by_eye()
     test_resume_request()
     test_min_off_disabled()
+    test_min_on_target_dwell()
+    test_dwell_and_hold_together()
+    test_dwell_reason_is_reported()
+    test_min_on_target_disabled()
+    test_no_face_is_not_a_blink()
     test_chatter_is_absorbed()
     test_stop_order()
     test_start_during_launch()

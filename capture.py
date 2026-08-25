@@ -65,6 +65,12 @@ class CaptureThread:
         # _gate_open. None means "not since this thread started", so the first
         # open of a run is never delayed.
         self._beam_off_since = None
+        # When the eye last arrived on target, or None if it is not there now.
+        # Advanced by _gate_open, which the loop calls exactly once a frame.
+        self._on_target_since = None
+        # Whether the dwell was what held the last decision shut, as _gate_open
+        # found it. Read by _gate_reason so the two can never disagree.
+        self._dwell_blocked = False
 
         self.running = False
         self.current_state = 'S'
@@ -73,6 +79,13 @@ class CaptureThread:
         self._last_iris_x       = None
         self._last_iris_y       = None
         self._last_deviation_mm = None
+        # Eye aspect ratio for whichever frame is current — set by
+        # detection.eye_aspect_ratio() in _detect_mp/_detect_mp_pupil before
+        # either compares it to config.EAR_BLINK_THRESHOLD, so it is captured
+        # on a blink frame too, not only on frames that go on to measure a
+        # deviation. Reset every frame like the fields above it: None means
+        # no face was found this frame, not that the eye was open.
+        self._last_ear = None
         # Survives blinks (unlike _last_iris_* above, which are cleared every
         # frame so a blink can't be mistaken for a real reading) — keeps the
         # eye-zoom crop anchored to the last real position instead of the
@@ -243,8 +256,8 @@ class CaptureThread:
             self._track_writer = csv.writer(self._track_file)
             self._track_writer.writerow([
                 'frame', 'host_time_iso', 't_capture', 't_decided',
-                'deviation_mm', 'iris_px', 'detect', 'gate', 'beam_state',
-                'reason'])
+                'deviation_mm', 'iris_px', 'ear', 'detect', 'gate',
+                'beam_state', 'reason'])
         except Exception:
             self._track_file = None
             self._track_writer = None
@@ -278,10 +291,13 @@ class CaptureThread:
             return 'no_face'
         if trigger is False:
             return 'blink' if self._last_deviation_mm is None else 'deviation'
-        # trigger is True but the gate is still shut: only the min-off hold
-        # can do that (see _gate_open) — anything else here would mean the two
-        # methods have drifted apart.
-        return 'hold'
+        # trigger is True but the gate is still shut: only the two opening
+        # conditions in _gate_open can do that — anything else here would mean
+        # the two methods have drifted apart. Report them apart, because they
+        # mean different things to whoever reads the log: 'hold' is the beam
+        # still cooling down from its own cut, 'dwell' is the eye back but not
+        # yet steady enough to trust.
+        return 'dwell' if self._dwell_blocked else 'hold'
 
     def _write_track_row(self, t_capture, trigger, armed_trigger):
         """Append one row to track.csv, if logging is on. Called from the
@@ -302,6 +318,8 @@ class CaptureThread:
                     else f'{self._last_deviation_mm:.4f}',
                 '' if self._last_iris_px is None
                     else f'{self._last_iris_px:.2f}',
+                '' if self._last_ear is None
+                    else f'{self._last_ear:.4f}',
                 '' if trigger is None else int(trigger),
                 int(armed_trigger), self.current_state,
                 self._gate_reason(trigger, armed_trigger)])
@@ -531,6 +549,7 @@ class CaptureThread:
                 self._last_iris_x       = None
                 self._last_iris_y       = None
                 self._last_deviation_mm = None
+                self._last_ear          = None
                 if face_mesh:
                     if self.params.get('detect_method') == 'facemesh_pupil':
                         result = self._detect_mp_pupil(frame, center, face_mesh)
@@ -538,7 +557,20 @@ class CaptureThread:
                         result = self._detect_mp(frame, center, face_mesh)
                 else:
                     result = None
-                trigger = result is True   # None (no face) or False (blink) → beam off
+                # Passed on as the detector returned it — None (no face found),
+                # False (face found, eye shut or off target), True (on target).
+                # Only True ever opens the beam, and every consumer below
+                # treats None and False alike for that purpose, so the beam
+                # decision is unchanged by keeping them apart here.
+                #
+                # It used to be flattened to `result is True` at this line,
+                # which cost nothing in safety and everything in diagnosis:
+                # _gate_reason and _write_track_row both already knew how to
+                # report a None, and neither could ever see one, so a lost face
+                # and a closed eye were both logged as 'blink'. Telling them
+                # apart in track.csv is the difference between reading a run
+                # and re-deriving it from the video afterwards.
+                trigger = result
                 self._strip_deque.append(self._last_deviation_mm)
 
                 # independent grayscale cross-check, throttled — never touches
@@ -812,30 +844,72 @@ class CaptureThread:
         can be tested without a camera. `trigger` is the detection result: True
         on target, False off target or blinking, None when no face was found.
 
-        The minimum-off hold is applied here and only here, and only to opening:
-        every path that closes the beam stays immediate. An eye resting exactly
-        on the threshold would otherwise chatter the shutter many times a
-        second, which leaves too little between transitions to time either one.
+        Two timing conditions guard the opening, both applied here and only
+        here, and both only to opening: every path that closes the beam stays
+        immediate. An eye resting exactly on the threshold would otherwise
+        chatter the shutter many times a second, which leaves too little
+        between transitions to time either one.
 
-        It is a trade, not a fix: holding longer buys fewer relay cycles at the
-        cost of beam duty cycle, measured at 92% with no hold down to 14% at a
-        5 s hold. The dose still has to reach the same MU either way, so a low
-        duty cycle is paid for in how long the patient is held in position. The
-        right value is a clinical judgement — see next.md.
+          min_off_s        how long the beam must stay down after a cut,
+                           counted from the cut
+          min_on_target_s  how long the eye must have been continuously on
+                           target before it may come back up, counted from
+                           when the eye arrived
+
+        The pair is deliberate. The hold alone counts only from the cut, so an
+        eye that returns at 0.9 s of a 1 s hold reopens the beam having held
+        still for 0.1 s, and a single bad frame after that switches the relay
+        twice inside ~130 ms. The dwell is what makes an opening evidence-based
+        rather than a matter of which frame the hold happens to expire on.
+
+        Neither can do anything but delay an opening, so neither can keep an
+        open beam from closing — the same one-way property the latches have.
+        Duty cycle is what they cost: the dose still has to reach the same MU,
+        so time not spent delivering is time the patient is held in position.
+        The right values are a clinical judgement — see next.md.
 
         auto_latched behaves like kill_latched here: it only ever blocks
         opening, never independently closes an already-open beam. It gets set
         elsewhere, at the moment of an eye-triggered close (_closed_by_eye),
         not read from here.
+
+        Called once per frame from the detection loop, which is what lets the
+        on-target clock below be kept here: one call, one frame. _gate_reason
+        reports on the same decision but must never advance it, so it reads
+        this state and does not touch it.
         """
+        now = now if now is not None else time.monotonic()
+        # The eye's own clock, independent of what the beam is doing: it starts
+        # when the eye arrives on target and is thrown away the moment it is
+        # not, so it can only ever measure an unbroken stretch.
+        if trigger:
+            if self._on_target_since is None:
+                self._on_target_since = now
+        else:
+            self._on_target_since = None
+
         if not (trigger and self.armed and not self.kill_latched
                 and not self.auto_latched):
             return False
         hold = self.params.get('min_off_s', config.DEFAULT_MIN_OFF_S)
+        # Recorded rather than recomputed: _gate_reason must describe the
+        # decision this call made, and a second read of the clock there would
+        # make it a second opinion about the beam taken a moment later.
+        self._dwell_blocked = self._dwell_pending(now)
         if hold and self._beam_off_since is not None:
-            if (now or time.monotonic()) - self._beam_off_since < hold:
+            if now - self._beam_off_since < hold:
                 return False
-        return True
+        return not self._dwell_blocked
+
+    def _dwell_pending(self, now):
+        """True while the eye has not yet held still long enough to reopen."""
+        dwell = self.params.get('min_on_target_s',
+                                config.DEFAULT_MIN_ON_TARGET_S)
+        if not dwell:
+            return False
+        if self._on_target_since is None:
+            return True
+        return now - self._on_target_since < dwell
 
     def _closed_by_eye(self):
         """True when a beam closure right now should trip the manual-resume
@@ -879,7 +953,8 @@ class CaptureThread:
         h, w = frame.shape[:2]
         side = self.params.get('side', 'left')
         for face in results.multi_face_landmarks:
-            if detection.eye_aspect_ratio(face, h, w, side) < config.EAR_BLINK_THRESHOLD:
+            self._last_ear = detection.eye_aspect_ratio(face, h, w, side)
+            if self._last_ear < config.EAR_BLINK_THRESHOLD:
                 return False
             ix, iy, ir = detection.iris_from_landmarks(face, h, w, side)
             self._last_iris_px = ir * 2
@@ -913,7 +988,8 @@ class CaptureThread:
         h, w = frame.shape[:2]
         side = self.params.get('side', 'left')
         for face in results.multi_face_landmarks:
-            if detection.eye_aspect_ratio(face, h, w, side) < config.EAR_BLINK_THRESHOLD:
+            self._last_ear = detection.eye_aspect_ratio(face, h, w, side)
+            if self._last_ear < config.EAR_BLINK_THRESHOLD:
                 return False
             ix, iy, ir = detection.iris_from_landmarks(face, h, w, side)
             self._last_iris_px = ir * 2

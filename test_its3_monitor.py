@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Checks for the RunControl pane scraping in alpide_daq.py.
+"""Checks for alpide_daq.py helpers that don't need real ALPIDE hardware:
+RunControl pane scraping, and the firmware-flash watchdog.
 
 Runs against a throwaway tmux session, never the real `ITS3` one — the six
 boards and that session name are shared with Kcmh-Tricker, and a test that
@@ -7,7 +8,9 @@ attached to a live acquisition could disturb a run.
 
     python3 test_its3_monitor.py
 """
+import os
 import subprocess
+import tempfile
 import time
 
 import alpide_daq
@@ -115,11 +118,85 @@ def test_leaves_real_session_alone():
           SESSION != alpide_daq.TMUX_SESSION and SESSION != 'ITS3')
 
 
+# ── firmware-flash watchdog ─────────────────────────────────────────────────
+# alpide-daq-program has no timeout of its own: a board that fails to
+# re-enumerate after being flashed leaves it blocked forever. Kcmh-Tricker's
+# own UI documents hitting exactly this and guards it with a timeout + kill —
+# these checks stand in a fake program for the real one so the hang (and the
+# fast, ordinary path next to it) can be exercised without real hardware, in
+# well under a second either way.
+
+def _fake_firmware_files():
+    """Point install_firmware() at throwaway files so it never depends on
+    Kcmh-Tricker's real firmware images being present on whatever machine
+    runs this test."""
+    d = tempfile.mkdtemp()
+    fx3 = os.path.join(d, 'fx3.img')
+    fpga = os.path.join(d, 'fpga.bit')
+    open(fx3, 'wb').close()
+    open(fpga, 'wb').close()
+    return fx3, fpga, []
+
+
+def _write_fake_programmer(d, body):
+    path = os.path.join(d, 'fake-alpide-daq-program')
+    with open(path, 'w') as f:
+        f.write('#!/bin/bash\n' + body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def test_firmware_watchdog_kills_a_hang():
+    print('\n-- a board that never re-enumerates gets killed, not waited on forever --')
+    d = tempfile.mkdtemp()
+    # exec, not a bare `sleep` line: bash defers a received SIGTERM until its
+    # current foreground command returns, so a plain `sleep 9999` run *as a
+    # child of bash* would swallow terminate() and defeat the very timeout
+    # under test. exec replaces the shell with sleep outright, so the signal
+    # lands on the thing actually blocking, exactly like the real tool's own
+    # blocking read does.
+    programmer = _write_fake_programmer(d, 'echo "Waiting for re-enumeration..."\nexec sleep 9999\n')
+    alpide_daq.firmware_files = _fake_firmware_files
+    alpide_daq._programmer = lambda: programmer
+
+    lines = []
+    t0 = time.monotonic()
+    ok = alpide_daq.install_firmware(on_line=lines.append, timeout_s=1)
+    elapsed = time.monotonic() - t0
+
+    check('reports failure', ok is False)
+    check('killed close to the timeout, not left hanging',
+          elapsed < 5, 'took %.2fs for a 1s timeout' % elapsed)
+    check('says why', any('timed out' in l for l in lines), 'lines %s' % lines)
+
+
+def test_firmware_ordinary_exit_is_not_a_timeout():
+    print('\n-- an ordinary quick exit is not mistaken for one --')
+    d = tempfile.mkdtemp()
+    programmer = _write_fake_programmer(
+        d, 'echo "Programming FX3(s): ..."\necho "ALL DONE"\nexit 0\n')
+    alpide_daq.firmware_files = _fake_firmware_files
+    alpide_daq._programmer = lambda: programmer
+
+    lines = []
+    t0 = time.monotonic()
+    ok = alpide_daq.install_firmware(on_line=lines.append, timeout_s=30)
+    elapsed = time.monotonic() - t0
+
+    check('reports success', ok is True)
+    check('returns promptly, not after waiting out the timeout',
+          elapsed < 2, 'took %.2fs' % elapsed)
+    check('no timeout line on a clean exit',
+          not any('timed out' in l for l in lines), 'lines %s' % lines)
+
+
 if __name__ == '__main__':
     test_parsing_offline()
     test_missing_session()
     test_live_pane()
     test_leaves_real_session_alone()
+    test_firmware_watchdog_kills_a_hang()
+    test_firmware_ordinary_exit_is_not_a_timeout()
     print()
     if FAILURES:
         print('%d failed: %s' % (len(FAILURES), ', '.join(FAILURES)))

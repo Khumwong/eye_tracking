@@ -349,7 +349,11 @@ def _sample(hits, intervals, want_on):
 
 
 def plane_levels(hits, intervals):
-    """Per-plane (noise_mean, noise_std, beam_mean, usable) from the run itself."""
+    """Per-plane (noise_mean, noise_std, beam_mean, usable, sigma) from the run
+    itself. `sigma` is how many standard errors bm sits above nm, over the same
+    REPORT_WIN scale PLANE_SNR is judged against — the number PLANE_SNR/
+    PLANE_MIN_RATIO decide `usable` from, surfaced so the report and
+    analysis.json can show the margin instead of just the pass/fail bit."""
     off = _sample(hits, intervals, False)
     on = _sample(hits, intervals, True)
     levels = []
@@ -361,10 +365,12 @@ def plane_levels(hits, intervals):
         bm = float(beam.mean()) if beam.size else float('nan')
         # Judged against this plane's own noise: an absolute cut cannot serve
         # planes whose quiet rates differ by a factor of 50.
-        margin = PLANE_SNR * max(ns, 1e-9) / np.sqrt(REPORT_WIN)
+        se = max(ns, 1e-9) / np.sqrt(REPORT_WIN)
+        margin = PLANE_SNR * se
+        sigma = (bm - nm) / se if noise.size and beam.size else float('nan')
         usable = bool(noise.size and beam.size and
                       bm > nm + margin and bm > PLANE_MIN_RATIO * nm)
-        levels.append((nm, ns, bm, usable))
+        levels.append((nm, ns, bm, usable, sigma))
     return levels
 
 
@@ -495,12 +501,21 @@ def report_health(run, meta, events, skipped, n_trig):
 
 def report_levels(run, levels, used):
     print('── beam vs noise (measured from this run) ' + '─' * 23)
-    print('  %-6s %10s %10s %10s   %s' % ('plane', 'noise', 'noise sd', 'beam', 'used'))
+    print('  %-6s %10s %10s %10s %8s   %s'
+          % ('plane', 'noise', 'noise sd', 'beam', 'sigma', 'used'))
     for j, dev in enumerate(run.planes):
-        nm, ns, bm, usable = levels[j]
-        print('  p%-5d %10.3f %10.3f %10.3f   %s'
-              % (dev, nm, ns, bm, 'yes' if usable else 'no'))
+        nm, ns, bm, usable, sigma = levels[j]
+        sigma_txt = '%8.1f' % sigma if not np.isnan(sigma) else '%8s' % '—'
+        print('  p%-5d %10.3f %10.3f %10.3f %s   %s'
+              % (dev, nm, ns, bm, sigma_txt, 'yes' if usable else 'no'))
     print('  planes used         : %s' % (used if used else 'none'))
+    if used:
+        print('  gate verdict         : BEAM CONFIRMED CUT during gate-closed '
+              'windows on %s' % ', '.join('p%d' % d for d in used))
+        print('                        each plane above drops to its own noise '
+              'level within the gate-closed intervals (>%.0fσ, >%.1fx its '
+              'noise) — a hit-rate drop that tracks the gate, not a '
+              'coincidence.' % (PLANE_SNR, PLANE_MIN_RATIO))
 
 
 def _event_latency_stats(rows, ev):
@@ -993,7 +1008,7 @@ def _run(args, analysis):
                          % meta['alpide_error'])
     events, skipped = read_beam_events(folder)
 
-    raws = sorted(glob.glob(os.path.join(folder, 'alpide', '*.raw')))
+    raws = sorted(glob.glob(os.path.join(folder, 'alpide', '**', '*.raw'), recursive=True))
     if not raws:
         report_app_side()
         analysis['verdict'] = 'no_raw_file'
@@ -1034,9 +1049,12 @@ def _run(args, analysis):
     report_levels(run, levels, used)
     analysis['levels'] = {
         'p%d' % dev: {'noise': round(nm, 3), 'noise_sd': round(ns, 3),
-                     'beam': round(bm, 3), 'used': bool(usable)}
-        for dev, (nm, ns, bm, usable) in zip(run.planes, levels)}
+                     'beam': round(bm, 3),
+                     'sigma': None if np.isnan(sigma) else round(sigma, 1),
+                     'used': bool(usable)}
+        for dev, (nm, ns, bm, usable, sigma) in zip(run.planes, levels)}
     analysis['planes_used'] = used
+    analysis['gate_verdict'] = 'confirmed_cut' if used else 'inconclusive'
 
     if not used:
         print()
@@ -1052,7 +1070,13 @@ def _run(args, analysis):
             analysis['verdict'] = 'daq_sync_problem'
         else:
             print('Expected for a run taken without protons — every frame is '
-                  'noise, so there is no drop to time.')
+                  'noise, so there is no drop to time. But this result alone')
+            print('cannot tell that apart from a beam that was present but not '
+                  'actually cut by the gate (a leak) — ALPIDE sees the same')
+            print('flat rate either way. Read this as "no signal", never as '
+                  '"gate confirmed working", unless an independent record')
+            print('(dose monitor, operator log) confirms protons were on '
+                  'target during this run.')
             analysis['verdict'] = 'no_beam_signal'
         return 2
 

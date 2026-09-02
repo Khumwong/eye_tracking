@@ -112,7 +112,7 @@ def main(argv=None):
             'fewer than 2 usable beam_events rows — not enough to fit the '
             'trigger<->clock bridge (need at least two B0/B1 transitions)')
 
-    raws = sorted(glob.glob(os.path.join(folder, 'alpide', '*.raw')))
+    raws = sorted(glob.glob(os.path.join(folder, 'alpide', '**', '*.raw'), recursive=True))
     if not raws:
         raise SystemExit('no .raw file in %s' % os.path.join(folder, 'alpide'))
     run = al.read_raw(raws[-1], progress=False)

@@ -10,6 +10,7 @@ Everything in this module is best-effort by design. ALPIDE recording is an
 addition to eye_tracking's job, never a precondition for it, so a failure here
 must never block READY/START/STOP or the beam gating they drive.
 """
+import glob
 import os
 import re
 import shutil
@@ -291,8 +292,10 @@ def stop_run(pid):
 
 
 def raw_files(outpath):
+    """Full paths of .raw files under outpath, at any depth (Kcmh-Tricker's
+    gen_its3_conf() may write them directly in outpath or in outpath/raw/)."""
     try:
-        return sorted(f for f in os.listdir(outpath) if f.endswith('.raw'))
+        return sorted(glob.glob(os.path.join(outpath, '**', '*.raw'), recursive=True))
     except Exception:
         return []
 
@@ -360,7 +363,7 @@ def wait_for_data(outpath, timeout=20.0):
     while time.time() < deadline:
         files = raw_files(outpath)
         if files:
-            size = os.path.getsize(os.path.join(outpath, files[0]))
+            size = os.path.getsize(files[0])
             if first is None:
                 first = size
             elif size > first:

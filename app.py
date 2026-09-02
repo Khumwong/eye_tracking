@@ -1,5 +1,6 @@
 import collections
 import cv2
+import glob
 import json
 import os
 import queue
@@ -325,6 +326,18 @@ class EyeTrackingApp:
                         font=('Helvetica', 9))
         lbl2.pack(side=tk.RIGHT)
         self._cam_led = (c2, ov2, lbl2)
+
+        f3 = tk.Frame(st, bg=PANEL)
+        f3.pack(fill=tk.X, pady=2)
+        c3 = tk.Canvas(f3, width=12, height=12, bg=PANEL, highlightthickness=0)
+        c3.pack(side=tk.LEFT, padx=(0, 8))
+        ov3 = c3.create_oval(2, 2, 10, 10, fill=MUTED, outline='')
+        tk.Label(f3, text="ALPIDE", bg=PANEL, fg=TEXT2,
+                 font=('Helvetica', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        lbl3 = tk.Label(f3, text="—", bg=PANEL, fg=MUTEDT,
+                        font=('Helvetica', 9))
+        lbl3.pack(side=tk.RIGHT)
+        self._alpide_sys_led = (c3, ov3, lbl3)
 
         # Precision indicator — primary (color) reading, with the grayscale
         # cross-check value shown right below each, smaller/muted, purely
@@ -1983,12 +1996,34 @@ class EyeTrackingApp:
     def _alpide_show(self, state=None, msg=None):
         if state is not None:
             self._alpide_state, self._alpide_board_msg = state, msg
+            # Self-healing, matching Kcmh-Tricker's own poll loop
+            # (_update_firmware_label calls install_firmware_auto on every
+            # tick while unprogrammed, unconditionally — its QTimer starts at
+            # widget construction, not at Enable). Boards drop back to DFU
+            # whenever they lose power or a run is killed, so flashing has to
+            # follow board presence on its own timeline, the same as the LED
+            # below does — not wait for the operator to have pressed ENABLE
+            # first, which would leave the board sitting unprogrammed (and
+            # LAUNCH DAQ refusing) with no visible reason why.
+            if state in ('unprogrammed', 'partial'):
+                self._alpide_prepare()
         state = getattr(self, '_alpide_state', 'missing')
         msg = getattr(self, '_alpide_board_msg', '—')
+        # 'missing' in red rather than muted: Kcmh-Tricker's own "No DAQ
+        # found" is red for the same reason — grey reads as "nothing to
+        # report", not "nothing is connected".
         colour = {'ready': GREEN_TXT, 'unprogrammed': AMBER_TXT,
-                  'partial': AMBER_TXT, 'missing': MUTED}.get(state, MUTED)
+                  'partial': AMBER_TXT, 'missing': RED_TXT}.get(state, MUTED)
         run = f'  ·  {self._alpide_msg}' if self._alpide_msg else ''
         self._alpide_lbl.config(text=f'{msg}{run}', fg=colour)
+        # SYSTEM STATUS row — same live-before-ENABLE visibility as Arduino/
+        # Camera above it, matching Kcmh-Tricker's own ALPIDE connection
+        # button: state readable at a glance, with no need to press Enable
+        # first just to find out whether the board is even usable.
+        c, ov, lbl = self._alpide_sys_led
+        c.itemconfig(ov, fill=colour)
+        lbl.config(text=msg, fg=colour)
+        self._refresh_flow()
 
     # ── ITS3 monitor ───────────────────────────────
     # RunControl's TUI is the only place the per-plane state exists, and it
@@ -2117,11 +2152,13 @@ class EyeTrackingApp:
             return
         self._alpide_busy = True
         self._alpide_note('flashing firmware…')
+        self._refresh_flow()   # repaint LAUNCH DAQ now, not at the next poll
 
         def _done(ok):
             self._alpide_busy = False
             self._alpide_note('firmware installed' if ok
                               else 'firmware install FAILED')
+            self.root.after(0, self._refresh_flow)
 
         threading.Thread(
             target=lambda: alpide_daq.install_firmware(on_done=_done),
@@ -2166,12 +2203,33 @@ class EyeTrackingApp:
         # 1 LAUNCH DAQ
         if not self.ready:
             self._paint(self.launch_btn, "▸   1  LAUNCH DAQ", self._OFF, False)
+        elif self._alpide_busy:
+            # Same reason 'launching' gets its own disabled label rather than
+            # just staying OFF: LAUNCH DAQ would otherwise still be sitting
+            # here painted bright/pressable (self.ready is already True) while
+            # _launch_daq()'s own guard silently no-ops the click — the exact
+            # "is it connected, can I press it yet" confusion this state
+            # exists to rule out. Flashing runs on Enable, before there is a
+            # folder or a launch sequence to watch, so this is its only cue.
+            self._paint(self.launch_btn, "⏳   1  flashing ALPIDE firmware…",
+                       self._OPEN, False)
         elif launching:
             self._paint(self.launch_btn, "    1  launching…", self._OPEN, False)
         elif self._daq_ready:
             self._paint(self.launch_btn, "✓   1  DAQ READY", self._DONE, False)
         elif armed:
             self._paint(self.launch_btn, "▸   1  LAUNCH DAQ", self._OFF, False)
+        elif getattr(self, '_alpide_state', 'missing') != 'ready':
+            # Kcmh-Tricker's Launch refuses the same way ("Unprogrammed DAQs
+            # / Please program DAQs") rather than trying and failing deep
+            # inside EUDAQ bring-up. _alpide_show already retries the flash
+            # on its own every poll while this holds (see there) — nothing to
+            # do here but say why LAUNCH DAQ will not go, and 'start without
+            # DAQ' below stays open the whole time as the way to run anyway.
+            reason = ('no ALPIDE found'
+                     if getattr(self, '_alpide_state', 'missing') == 'missing'
+                     else 'ALPIDE firmware not ready')
+            self._paint(self.launch_btn, f"✕   1  {reason}", self._OFF, False)
         else:
             self._paint(self.launch_btn, "▸   1  LAUNCH DAQ", self._NEXT, True)
 
@@ -2617,13 +2675,13 @@ class EyeTrackingApp:
         """
         if not folder:
             return
-        raw_dir = os.path.join(folder, 'alpide')
+        raw_glob = os.path.join(folder, 'alpide', '**', '*.raw')
         try:
-            raws = sorted(f for f in os.listdir(raw_dir) if f.endswith('.raw'))
+            raws = sorted(glob.glob(raw_glob, recursive=True))
         except Exception:
             raws = []
         if raws:
-            path = os.path.join(raw_dir, raws[-1])
+            path = raws[-1]
             last = -1
             for _ in range(5):
                 try:
